@@ -68,6 +68,23 @@ export const courses: CourseMetadata[] = withCourseNumber([
     ],
   },
   {
+    slug: "introduction-to-defi",
+    language: "General",
+    color: BRAND_COLOURS.general,
+    difficulty: 1,
+    isFeatured: true,
+    lessons: [
+      { slug: "defi-math-essentials" },
+      { slug: "amms-and-constant-product" },
+      { slug: "liquidity-provision" },
+      { slug: "lending-and-borrowing" },
+      { slug: "perpetuals-and-leverage" },
+      { slug: "oracles" },
+      { slug: "circuit-breakers" },
+      { slug: "conclusion" },
+    ],
+  },
+  {
     slug: "program-security",
     language: "General",
     color: BRAND_COLOURS.general,

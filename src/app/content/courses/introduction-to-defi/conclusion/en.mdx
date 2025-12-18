@@ -1,0 +1,95 @@
+import { ArticleSection } from "../../../../components/ArticleSection/ArticleSection";
+
+# Conclusion
+
+You've covered the core primitives that power decentralized finance. AMMs, liquidity provision, lending, perpetuals, and oracle integration. Each builds on the last.
+
+But the real power of DeFi isn't in any single primitive. It's in how they compose.
+
+<ArticleSection name="Money Legos" id="money-legos" level="h2" />
+
+DeFi protocols are composable. The output of one becomes the input of another. This creates exponential possibilities:
+
+```
+Deposit SOL into lending protocol
+→ Receive receipt tokens (cSOL)
+→ Use cSOL as collateral in another protocol
+→ Borrow stablecoins
+→ LP those stablecoins in an AMM
+→ Use LP tokens as collateral for a perp position
+→ All in one transaction
+```
+
+Each layer adds risk. But also capital efficiency. Understanding each primitive means understanding how they interact.
+
+<ArticleSection name="Security Mindset Recap" id="security-recap" level="h2" />
+
+### Math
+
+Every DeFi exploit starts with a math mistake:
+
+- **Rounding**: Protocol favors user → drainable through dust accumulation
+- **Overflow**: Unchecked arithmetic → catastrophic failures
+- **Precision**: Mixed decimals → value extraction
+- **Order**: Multiply before divide → preserve precision
+
+The fix is mechanical. Check every calculation. Round in the protocol's favor. Use checked math. Test edge cases.
+
+### Oracles
+
+Oracles are the bridge to reality. A corrupted bridge corrupts everything built on it:
+
+- **Staleness**: Old prices during volatility → bad valuations
+- **Confidence**: Wide intervals → uncertain values
+- **Manipulation**: Single-source prices → exploitable
+- **Validation**: Missing checks → silent failures
+
+The fix is paranoia. Never trust raw oracle data. Validate staleness, confidence, sanity. Use multiple sources. Fail closed when uncertain.
+
+### Economic Attacks
+
+Technical security isn't enough. Economic incentives create attack surfaces:
+
+- **Flash loans**: Zero-cost capital for single-transaction exploits
+- **Sandwich attacks**: Profit from knowing others' transactions
+- **Liquidation cascades**: Forced selling creates more forced selling
+- **Governance attacks**: Accumulate votes, pass malicious proposals
+
+The fix is game theory. Assume adversarial actors. Model attack profitability. Make attacks cost more than they gain.
+
+<ArticleSection name="What's Next" id="whats-next" level="h2" />
+
+### Beyond the Basics
+
+This course covered essentials. Production DeFi goes deeper:
+
+**Concentrated liquidity**: Uniswap V3 style. More math, more capital efficiency, more complexity.
+
+**Multi-collateral systems**: Multiple assets as collateral with different risk parameters.
+
+**Cross-margin**: Shared margin across positions. More efficient, harder to implement safely.
+
+**Governance tokens**: Voting, fee distribution, protocol upgrades.
+
+**MEV protection**: Private mempools, batch auctions, fair ordering.
+
+Each deserves its own deep dive. But the fundamentals here underpin everything.
+
+### The Builder's Mindset
+
+DeFi is adversarial by design. Your code holds real money. Attackers are watching.
+
+Build like someone's trying to break your protocol. Because they are.
+
+- Test edge cases exhaustively
+- Audit before mainnet
+- Start with limits (max TVL, position sizes)
+- Monitor for anomalies
+- Have circuit breakers
+- Plan for failure
+
+The math is elegant. The code is precise. The security is paranoid.
+
+That's how you build DeFi that lasts.
+
+Now go build something.

@@ -49,6 +49,20 @@
         "conclusion": "Conclusion"
       }
     },
+    "introduction-to-defi": {
+      "title": "Introduction to DeFi",
+      "lessons": {
+        "introduction": "Introduction",
+        "defi-math-essentials": "DeFi Math Essentials",
+        "amms-and-constant-product": "AMMs and Constant Product",
+        "liquidity-provision": "Liquidity Provision",
+        "lending-and-borrowing": "Lending and Borrowing",
+        "perpetuals-and-leverage": "Perpetuals and Leverage",
+        "oracles": "Oracles",
+        "circuit-breakers": "Circuit Breakers",
+        "conclusion": "Conclusion"
+      }
+    },
     "program-security": {
       "title": "Program Security",
       "lessons": {

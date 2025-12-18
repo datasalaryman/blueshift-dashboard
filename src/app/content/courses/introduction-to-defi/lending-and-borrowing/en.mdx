@@ -1,0 +1,490 @@
+import { ArticleSection } from "../../../../components/ArticleSection/ArticleSection";
+
+# Lending & Borrowing
+
+Lending protocols are DeFi's take on banks. Deposit assets to earn yield or to use as collateral to borrow other assets. 
+
+The difference: no credit checks, no waiting, no humans. Just math.
+
+The cycle is simple: supply assets, borrow against them, repay with interest. But the math underneath handles edge cases that traditional finance solves with lawyers and collection agencies.
+
+What happens when collateral drops in value? When borrowers don't repay? When interest rates need to incentivize behavior changes? All of this is governed by code.
+
+<ArticleSection name="Core Mechanics" id="core-mechanics" level="h2" />
+
+### The Shares Model
+
+Lending protocols track deposits like AMMs track LP tokens. Deposit USDC, receive "shares" representing your claim on the pool.
+
+```rust
+#[account]
+pub struct LendingPool {
+    pub total_deposits: u64,     // Actual USDC in pool
+    pub total_shares: u64,       // Receipt tokens minted
+    pub total_borrows: u64,      // USDC borrowed out
+    pub interest_index: u128,    // Accumulated interest multiplier
+}
+```
+
+Why shares instead of tracking raw deposits? Interest.
+
+When borrowers pay interest, the pool grows. But we don't update every depositor's balance. Instead, the share-to-asset ratio changes:
+
+```rust
+// Deposit 1000 USDC when pool has 10,000 USDC and 10,000 shares
+let shares_minted = (1000 * 10_000) / 10_000;  // 1000 shares
+
+// Later, interest accrues. Pool now has 11,000 USDC, still 10,000 shares
+// Each share worth: 11,000 / 10,000 = 1.1 USDC
+
+// Your 1000 shares now redeem for:
+let withdraw = (1000 * 11_000) / 10_000;  // 1100 USDC
+```
+
+### Deposit Flow
+
+```rust
+pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+    let pool = &mut ctx.accounts.pool;
+
+    // Calculate shares to mint (round DOWN - protocol keeps dust)
+    let shares = if pool.total_shares == 0 {
+        amount  // First deposit: 1:1
+    } else {
+        (amount as u128 * pool.total_shares as u128 / pool.total_deposits as u128) as u64
+    };
+
+    // Transfer USDC to pool
+    transfer(/* user -> pool vault */, amount)?;
+
+    // Mint receipt tokens
+    mint_to(/* -> user */, shares)?;
+
+    // Update state
+    pool.total_deposits += amount;
+    pool.total_shares += shares;
+
+    Ok(())
+}
+```
+
+### Borrow Flow
+
+Borrowing requires collateral already deposited. You can't borrow more than your collateral allows (overcollateralization).
+
+```rust
+pub fn borrow(ctx: Context<Borrow>, amount: u64) -> Result<()> {
+    let pool = &mut ctx.accounts.pool;
+    let position = &mut ctx.accounts.user_position;
+
+    // Check collateral covers this borrow (we'll detail this math soon)
+    let max_borrow = calculate_max_borrow(position.collateral_value, pool.ltv_ratio);
+    require!(position.borrowed + amount <= max_borrow, ErrorCode::InsufficientCollateral);
+
+    // Transfer borrowed asset to user
+    transfer(/* pool vault -> user */, amount)?;
+
+    // Track debt (round UP - user owes more)
+    position.borrowed += amount;
+    pool.total_borrows += amount;
+
+    Ok(())
+}
+```
+
+### Repay Flow
+
+```rust
+pub fn repay(ctx: Context<Repay>, amount: u64) -> Result<()> {
+    let pool = &mut ctx.accounts.pool;
+    let position = &mut ctx.accounts.user_position;
+
+    // Can't repay more than owed
+    let debt = calculate_debt_with_interest(position, pool);
+    let repay_amount = std::cmp::min(amount, debt);
+
+    // Transfer from user to pool
+    transfer(/* user -> pool vault */, repay_amount)?;
+
+    // Update debt (interest already included in debt calculation)
+    position.borrowed = debt - repay_amount;
+    pool.total_borrows -= repay_amount;
+
+    Ok(())
+}
+```
+
+<ArticleSection name="Collateralization Math" id="collateralization" level="h2" />
+
+### LTV: Loan to Value
+
+LTV defines how much you can borrow against collateral. 75% LTV means $100 of collateral lets you borrow $75.
+
+```rust
+const LTV_BPS: u64 = 7500;  // 75%
+
+pub fn calculate_max_borrow(collateral_value: u64, ltv_bps: u64) -> u64 {
+    // Round DOWN - user can borrow less
+    (collateral_value as u128 * ltv_bps as u128 / 10_000) as u64
+}
+```
+
+### Liquidation Threshold
+
+The liquidation threshold is higher than LTV. It's the danger zone.
+
+```rust
+const LTV_BPS: u64 = 7500;          // Can borrow up to 75%
+const LIQ_THRESHOLD_BPS: u64 = 8000; // Liquidated at 80%
+```
+
+This buffer is there to protect depositors. You want to be proactive in collecting debt in case there is a big spike that would pass the bad debt to creditors.
+
+### Health Factor
+
+You deposited $10,000 in SOL and borrowed $7,500 USDC. SOL drops 10%. Are you safe or liquidated?
+
+This is what **health factor** answers. It's the single number that determines if your position survives.
+
+```rust
+// health = (collateral_value * liquidation_threshold) / debt_value
+pub fn calculate_health_factor(
+    collateral_value: u128,
+    debt_value: u128,
+    liq_threshold_bps: u64,
+) -> u128 {
+    if debt_value == 0 {
+        return u128::MAX;  // No debt = infinite health
+    }
+
+    // Round DOWN - triggers liquidation sooner (protocol protection)
+    (collateral_value * liq_threshold_bps as u128) / (debt_value * 10_000)
+}
+```
+
+Example walkthrough:
+
+```rust
+// Deposit $10,000 SOL as collateral
+// Borrow $7,500 USDC (at 75% LTV)
+// Liquidation threshold: 80%
+
+let health = (10_000 * 8000) / (7_500 * 10_000);
+// health = 80,000,000 / 75,000,000 = 1.066
+
+// SOL drops 10%, collateral now worth $9,000
+let new_health = (9_000 * 8000) / (7_500 * 10_000);
+// new_health = 72,000,000 / 75,000,000 = 0.96
+
+// health < 1.0: position is liquidatable
+```
+
+### Per-Asset Risk Parameters
+
+Real protocols assign risk parameters per asset:
+
+```rust
+#[account]
+pub struct AssetConfig {
+    pub mint: Pubkey,
+    pub ltv_bps: u16,           // Max borrow ratio
+    pub liq_threshold_bps: u16, // Liquidation trigger
+    pub liq_bonus_bps: u16,     // Liquidator incentive
+    pub oracle: Pubkey,         // Price feed
+}
+```
+
+Multi-collateral positions weight each asset:
+
+```rust
+pub fn calculate_position_health(
+    collaterals: &[(u64, AssetConfig, u64)],  // (amount, config, price)
+    debts: &[(u64, u64)],                      // (amount, price)
+) -> u128 {
+    let mut weighted_collateral: u128 = 0;
+    let mut total_debt: u128 = 0;
+
+    for (amount, config, price) in collaterals {
+        let value = (*amount as u128) * (*price as u128) / PRICE_PRECISION;
+        weighted_collateral += value * config.liq_threshold_bps as u128 / 10_000;
+    }
+
+    for (amount, price) in debts {
+        total_debt += (*amount as u128) * (*price as u128) / PRICE_PRECISION;
+    }
+
+    if total_debt == 0 {
+        return u128::MAX;
+    }
+
+    (weighted_collateral * PRECISION) / total_debt
+}
+```
+
+<ArticleSection name="Interest Rate Models" id="interest-rates" level="h2" />
+
+### Utilization
+
+Utilization is the percentage of deposits that are borrowed:
+
+```rust
+pub fn calculate_utilization(total_borrows: u64, total_deposits: u64) -> u64 {
+    if total_deposits == 0 {
+        return 0;
+    }
+    (total_borrows as u128 * PRECISION / total_deposits as u128) as u64
+}
+```
+
+Utilization drives everything:
+- Too low means lenders earn nothing because their capital sits idle. 
+- Too high means depositors can't withdraw when they need to.
+
+### The Two-Sided Incentive Problem
+
+Interest rates must balance two competing needs:
+
+1. **Lenders** want high yields to justify locking their capital
+2. **Borrowers** want low rates to make leverage affordable
+
+The protocol uses utilization-based rates to create a self-balancing market:
+
+- **Low utilization** → Low borrow rates → Attracts borrowers → Utilization rises
+- **High utilization** → High borrow rates → Attracts lenders (better yield) AND discourages borrowers → Utilization falls
+
+Higher borrow rates mean lenders earn more, making the pool more attractive compared to other yield opportunities. This draws in new deposits, increasing available liquidity.
+
+### Linear Interest Model
+
+Simple: interest increases linearly with utilization.
+
+```rust
+const BASE_RATE: u64 = 200;    // 2% at 0% utilization
+const SLOPE: u64 = 2000;       // +20% at 100% utilization
+
+pub fn calculate_borrow_rate(utilization: u64) -> u64 {
+    // rate = base + slope * utilization
+    BASE_RATE + (SLOPE * utilization / PRECISION)
+}
+```
+
+### Kinked Model (Industry Standard)
+
+Problem with linear: at high utilization, rates aren't punishing enough to restore balance quickly. Solution: a "kink" that sharply increases rates past optimal utilization.
+
+```rust
+const OPTIMAL_UTILIZATION: u64 = 800_000_000;  // 80%
+const BASE_RATE: u64 = 20_000_000;             // 2%
+const SLOPE_1: u64 = 40_000_000;               // 4% slope before kink
+const SLOPE_2: u64 = 750_000_000;              // 75% slope after kink
+
+pub fn calculate_borrow_rate(utilization: u64) -> u64 {
+    if utilization <= OPTIMAL_UTILIZATION {
+        // Below kink: gentle slope
+        BASE_RATE + (utilization * SLOPE_1 / OPTIMAL_UTILIZATION)
+    } else {
+        // Above kink: steep slope
+        let base_at_kink = BASE_RATE + SLOPE_1;
+        let excess = utilization - OPTIMAL_UTILIZATION;
+        let max_excess = PRECISION - OPTIMAL_UTILIZATION;
+        base_at_kink + (excess * SLOPE_2 / max_excess)
+    }
+}
+```
+
+These constants are tuned to create specific behaviors:
+
+- At 80% utilization: ~6% borrow rate (sustainable equilibrium)
+- At 90% utilization: ~40% borrow rate (painful for borrowers, attractive for lenders)
+- At 100% utilization: ~80% borrow rate (emergency - strong incentive to rebalance)
+
+The steep curve after the kink creates urgency on both sides: borrowers rush to repay (expensive debt), and lenders rush to deposit (high yields). The protocol doesn't need to intervene - the math enforces the behavior automatically.
+
+### Interest Index Accumulator
+
+Tracking interest per user is expensive. Instead, protocols use an accumulator pattern:
+
+```rust
+#[account]
+pub struct LendingPool {
+    pub borrow_index: u128,     // Starts at 1.0 (PRECISION)
+    pub last_update: i64,       // Last accrual timestamp
+    // ...
+}
+
+#[account]
+pub struct UserPosition {
+    pub borrowed_shares: u64,    // Not raw amount, but indexed shares
+    pub borrow_index_at_open: u128,  // Index when borrowed
+}
+
+pub fn accrue_interest(pool: &mut LendingPool, current_time: i64) {
+    let time_elapsed = current_time - pool.last_update;
+    if time_elapsed <= 0 {
+        return;
+    }
+
+    let utilization = calculate_utilization(pool.total_borrows, pool.total_deposits);
+    let rate = calculate_borrow_rate(utilization);
+
+    // Compound interest: index *= (1 + rate * time / year)
+    let interest_factor = PRECISION + (rate * time_elapsed as u64 / SECONDS_PER_YEAR);
+    pool.borrow_index = pool.borrow_index * interest_factor as u128 / PRECISION as u128;
+
+    // Update total borrows to reflect accrued interest
+    pool.total_borrows = (pool.total_borrows as u128 * interest_factor as u128 / PRECISION as u128) as u64;
+
+    pool.last_update = current_time;
+}
+
+pub fn get_current_debt(position: &UserPosition, pool: &LendingPool) -> u64 {
+    // debt = shares * (current_index / index_at_borrow)
+    (position.borrowed_shares as u128
+        * pool.borrow_index
+        / position.borrow_index_at_open) as u64
+}
+```
+
+<ArticleSection name="Liquidations" id="liquidations" level="h2" />
+
+### When Health Drops Below 1
+
+Anyone can liquidate unhealthy positions. The liquidator:
+1. Repays part of the borrower's debt
+2. Receives the borrower's collateral at a discount (liquidation bonus)
+
+```rust
+pub fn liquidate(
+    ctx: Context<Liquidate>,
+    debt_to_repay: u64,
+) -> Result<()> {
+    let position = &mut ctx.accounts.borrower_position;
+    let pool = &ctx.accounts.pool;
+
+    // Verify position is liquidatable
+    let health = calculate_health_factor(position, pool);
+    require!(health < PRECISION, ErrorCode::PositionHealthy);
+
+    // Apply close factor (can't liquidate 100% at once)
+    let max_repay = position.debt * pool.close_factor_bps / 10_000;
+    let repay_amount = std::cmp::min(debt_to_repay, max_repay);
+
+    // Calculate collateral to seize (including bonus)
+    let collateral_value = repay_amount * (10_000 + pool.liq_bonus_bps) / 10_000;
+    let collateral_amount = collateral_value * PRICE_PRECISION / collateral_price;
+
+    // Execute transfers
+    transfer(/* liquidator pays debt */)?;
+    transfer(/* borrower's collateral to liquidator */)?;
+
+    // Update positions
+    position.debt -= repay_amount;
+    position.collateral -= collateral_amount;
+
+    Ok(())
+}
+```
+
+### Close Factor
+
+Why not liquidate 100% at once? It's aggressive and can cascade. Close factor (typically 50%) limits how much can be liquidated per transaction.
+
+```rust
+const CLOSE_FACTOR_BPS: u64 = 5000;  // 50%
+
+let max_liquidatable = total_debt * CLOSE_FACTOR_BPS / 10_000;
+```
+
+Multiple liquidators can chip away at a position over multiple transactions.
+
+This protects the borrower from spikes because they don't get fully liquidated if the price is hovering around the health factor, and protects creditors because liquidating big positions might incur slippage higher than the "protection" buffer.
+
+### Liquidation Bonus
+
+The bonus incentivizes liquidators to act quickly. Typical: 5-10%.
+
+```rust
+const LIQ_BONUS_BPS: u64 = 500;  // 5%
+
+// Liquidator repays $100 of debt
+// Receives $105 worth of collateral
+let collateral_seized = debt_repaid * (10_000 + LIQ_BONUS_BPS) / 10_000;
+```
+
+Higher bonus = faster liquidations but more punishing for borrowers.
+
+### Bad Debt
+
+Sometimes collateral drops so fast that even with liquidation bonus, there's not enough to cover debt. This is bad debt.
+
+```rust
+// Collateral: $95
+// Debt: $100
+// Liquidation bonus: 5%
+
+// Liquidator would need $100 * 1.05 = $105 of collateral
+// But only $95 exists
+
+// Options:
+// 1. Liquidate at loss (no bonus or negative bonus)
+// 2. Socialize loss across depositors
+// 3. Insurance fund covers
+```
+
+Protocols handle this differently. Most have an insurance fund. When depleted, depositors share the loss.
+
+<ArticleSection name="Common Vulnerabilities" id="vulnerabilities" level="h2" />
+
+### Oracle Manipulation
+
+Flash loan + manipulate thin market + borrow against inflated collateral = drain protocol.
+
+```rust
+// Attack:
+// 1. Flash loan massive amount
+// 2. Buy token X on thin DEX, spiking price
+// 3. Deposit X as collateral (now overvalued)
+// 4. Borrow real assets against fake value
+// 5. Don't repay, profit from inflated borrow
+```
+
+**Mitigations:**
+- Never use spot price as oracle
+- Use Pyth/Switchboard with confidence intervals
+- TWAP for sensitive operations
+- Sanity bounds on price changes
+
+### Interest Rounding Accumulation
+
+Small rounding errors compound over time. Always round interest UP (in protocol's favor).
+
+```rust
+// Bad: rounds down, loses value over millions of operations
+interest = principal * rate / PRECISION;
+
+// Good: rounds up
+interest = (principal * rate + PRECISION - 1) / PRECISION;
+```
+
+### Liquidation Cascades
+
+One liquidation can trigger another. Position A liquidated → token dumps → Position B now undercollateralized → liquidated → cascade.
+
+**Mitigations:**
+- Conservative LTV ratios
+- Gradual liquidation (close factor)
+- Circuit breakers on rapid price moves
+
+### Flash Loan + Price Manipulation
+
+Similar to oracle manipulation but targeting the liquidation process:
+
+```rust
+// Attack:
+// 1. Flash loan
+// 2. Manipulate price down
+// 3. Liquidate positions at artificial discount
+// 4. Price recovers, profit from cheap collateral
+```
+
+**Mitigation:** Use time-weighted prices for liquidation triggers.

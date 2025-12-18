@@ -1,0 +1,483 @@
+import { ArticleSection } from "../../../../components/ArticleSection/ArticleSection";
+
+# Circuit Breakers
+
+November 2022. FTX collapses. Crypto markets drop 25% in hours. Liquidation bots fire simultaneously across every lending protocol. Some protocols pause. Others don't.
+
+The ones that didn't pause watched cascading liquidations drain liquidity pools, bad debt accumulate faster than insurance funds could cover, and users lose millions to forced closures at the worst possible prices.
+
+Circuit breakers are your protocol's emergency stop. They're the difference between "we paused during the chaos and resumed when it passed" and "we're insolvent."
+
+Every DeFi primitive we've covered; AMMs, lending, perpetuals, needs circuit breakers. This lesson covers when to trigger them, how to implement them, and the tradeoffs involved.
+
+<ArticleSection name="Why Protocols Need Emergency Stops" id="why-circuit-breakers" level="h2" />
+
+### The Cascade Problem
+
+DeFi protocols don't fail in isolation. They're interconnected through shared liquidity, collateral, and price feeds. When one piece breaks, the damage spreads:
+
+```
+Oracle returns stale price during volatility
+→ Lending protocol values collateral incorrectly  
+→ Positions that should be liquidated aren't
+→ Bad debt accumulates
+→ Protocol becomes insolvent
+→ Users rush to withdraw (bank run)
+→ Liquidity crisis spreads to other protocols using that token
+```
+
+Or the opposite cascade:
+
+```
+Market drops 20% in minutes
+→ Liquidation bots activate
+→ Mass selling of collateral
+→ Price drops further from liquidation pressure
+→ More positions become liquidatable
+→ More liquidations, more selling
+→ Death spiral until buying absorbs the pressure
+```
+
+Circuit breakers interrupt these cascades. They give the system time to stabilize, humans time to assess, and prevent bad situations from becoming catastrophic ones.
+
+### When to Trigger
+
+Circuit breakers should activate when something is clearly wrong:
+
+**Price anomalies**: Price moves beyond reasonable bounds in short time (50% in 5 minutes is not normal market behavior)
+
+**Oracle failures**: Stale data, missing feeds, confidence intervals exploding
+
+**Unusual volume**: Sudden spike in liquidations, withdrawals, or borrows
+
+**Technical issues**: Failed transactions, network congestion, upgrade bugs
+
+**External events**: Exchange hacks, stablecoin depegs, regulatory announcements
+
+The challenge is distinguishing "something is wrong" from "markets are volatile but functioning." Pause too eagerly and you frustrate users during normal volatility. Pause too late and the damage is done.
+
+<ArticleSection name="Types of Circuit Breakers" id="types" level="h2" />
+
+### Global Pause
+
+The nuclear option. Everything stops.
+
+```rust
+#[account]
+pub struct Protocol {
+    pub paused: bool,
+    pub pause_authority: Pubkey,
+    // ...
+}
+
+pub fn check_not_paused(protocol: &Protocol) -> Result<()> {
+    require!(!protocol.paused, ErrorCode::ProtocolPaused);
+    Ok(())
+}
+
+pub fn pause(ctx: Context<Pause>) -> Result<()> {
+    require!(
+        ctx.accounts.authority.key() == ctx.accounts.protocol.pause_authority,
+        ErrorCode::Unauthorized
+    );
+    ctx.accounts.protocol.paused = true;
+    emit!(ProtocolPaused { timestamp: Clock::get()?.unix_timestamp });
+    Ok(())
+}
+```
+
+Every instruction checks `check_not_paused()` before executing. Simple. Effective. But blunt; legitimate users can't do anything, including withdrawing their funds.
+
+**Use for**: Active exploits, critical bugs, existential threats.
+
+### Per-Market Pause
+
+More surgical. Pause one market while others continue operating.
+
+```rust
+#[account]
+pub struct Market {
+    pub paused: bool,
+    pub deposits_paused: bool,
+    pub borrows_paused: bool,
+    pub liquidations_paused: bool,
+    // ...
+}
+
+pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+    let market = &ctx.accounts.market;
+    require!(!market.paused, ErrorCode::MarketPaused);
+    require!(!market.deposits_paused, ErrorCode::DepositsPaused);
+    // ... rest of deposit logic
+}
+```
+
+This lets you pause a problematic asset (maybe its oracle is failing) without affecting the entire protocol. Users in healthy markets continue operating normally.
+
+**Use for**: Oracle issues on specific feeds, unusual activity in one market, asset-specific problems.
+
+### Gradual Restrictions
+
+Instead of binary on/off, progressively restrict operations as conditions worsen:
+
+```rust
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq)]
+pub enum ProtocolMode {
+    Normal,           // Full functionality
+    Cautious,         // Reduced leverage, tighter limits
+    Restricted,       // Withdrawals only, no new positions
+    Emergency,        // Nothing except admin actions
+}
+
+#[account]
+pub struct Protocol {
+    pub mode: ProtocolMode,
+    // ...
+}
+
+pub fn open_position(ctx: Context<OpenPosition>, size: u64) -> Result<()> {
+    match ctx.accounts.protocol.mode {
+        ProtocolMode::Normal => { /* normal limits */ },
+        ProtocolMode::Cautious => {
+            // Reduce max leverage, increase margin requirements
+            require!(size <= MAX_SIZE_CAUTIOUS, ErrorCode::SizeExceedsLimit);
+        },
+        ProtocolMode::Restricted | ProtocolMode::Emergency => {
+            return err!(ErrorCode::NewPositionsDisabled);
+        },
+    }
+    // ...
+}
+```
+
+This gives you flexibility. When you detect anomalies, move to Cautious mode so new users face stricter limits but existing users aren't blocked. If things worsen, escalate to Restricted, then Emergency.
+
+**Use for**: Gradual response to developing situations, giving users time to react.
+
+<ArticleSection name="Automatic vs Manual Triggers" id="triggers" level="h2" />
+
+### Automatic Triggers
+
+Some conditions should trigger immediate, automatic pauses without human intervention:
+
+```rust
+pub fn check_price_circuit_breaker(
+    market: &mut Market,
+    current_price: u64,
+    current_time: i64,
+) -> Result<()> {
+    // Check price change since last update
+    if market.last_price > 0 {
+        let price_change = if current_price > market.last_price {
+            (current_price - market.last_price) * 10_000 / market.last_price
+        } else {
+            (market.last_price - current_price) * 10_000 / market.last_price
+        };
+
+        let time_elapsed = current_time - market.last_price_time;
+
+        // >30% move in <5 minutes = automatic pause
+        if price_change > 3000 && time_elapsed < 300 {
+            market.paused = true;
+            emit!(AutomaticPause {
+                market: market.key(),
+                reason: PauseReason::RapidPriceMove,
+                price_change,
+                time_elapsed,
+            });
+            return err!(ErrorCode::CircuitBreakerTriggered);
+        }
+    }
+
+    market.last_price = current_price;
+    market.last_price_time = current_time;
+    Ok(())
+}
+```
+
+Automatic triggers are fast - they can respond in the same transaction that detects the anomaly. But they need careful tuning. Too sensitive and you'll pause during normal volatility. Too loose and they won't catch real problems.
+
+### Liquidation Rate Breaker
+
+One of the most important automatic triggers is the one that detect liquidation cascades:
+
+```rust
+#[account]
+pub struct Market {
+    pub liquidations_this_window: u64,
+    pub window_start: i64,
+    pub max_liquidations_per_window: u64,
+    // ...
+}
+
+const WINDOW_DURATION: i64 = 300; // 5 minutes
+
+pub fn record_liquidation(market: &mut Market, current_time: i64) -> Result<()> {
+    // Reset window if expired
+    if current_time - market.window_start > WINDOW_DURATION {
+        market.liquidations_this_window = 0;
+        market.window_start = current_time;
+    }
+
+    market.liquidations_this_window += 1;
+
+    // Too many liquidations = something is wrong
+    if market.liquidations_this_window > market.max_liquidations_per_window {
+        market.liquidations_paused = true;
+        emit!(LiquidationsPaused {
+            market: market.key(),
+            liquidation_count: market.liquidations_this_window,
+        });
+    }
+
+    Ok(())
+}
+```
+
+If you're seeing 100 liquidations in 5 minutes when you normally see 5, something is wrong. Maybe an oracle issue, maybe a flash crash, maybe a coordinated attack. Pause liquidations, assess, then resume.
+
+### Manual Triggers
+
+Some situations require human judgment:
+
+- Is this a real exploit or just unusual but legitimate activity?
+- Has a stablecoin depegged or is this temporary volatility?
+- Should we pause everything or just specific functions?
+
+```rust
+pub fn admin_pause(
+    ctx: Context<AdminPause>,
+    pause_type: PauseType,
+    reason: String,
+) -> Result<()> {
+    // Verify authority
+    require!(
+        ctx.accounts.authority.key() == ctx.accounts.protocol.admin
+            || ctx.accounts.authority.key() == ctx.accounts.protocol.guardian,
+        ErrorCode::Unauthorized
+    );
+
+    match pause_type {
+        PauseType::Global => ctx.accounts.protocol.paused = true,
+        PauseType::Market(market_key) => {
+            // Pause specific market
+        },
+        PauseType::Function(function) => {
+            // Pause specific function (deposits, borrows, etc.)
+        },
+    }
+
+    emit!(ManualPause {
+        authority: ctx.accounts.authority.key(),
+        pause_type,
+        reason,
+        timestamp: Clock::get()?.unix_timestamp,
+    });
+
+    Ok(())
+}
+```
+
+Consider having a "guardian" role that can only pause (not unpause or change protocol parameters). This limits the damage if the guardian key is compromised while still allowing fast emergency response.
+
+<ArticleSection name="The Unpause Problem" id="unpause" level="h2" />
+
+Pausing is easy. Knowing when to unpause is hard.
+
+### Time-Locked Unpause
+
+Prevent knee-jerk unpauses by requiring a delay:
+
+```rust
+#[account]
+pub struct Protocol {
+    pub paused: bool,
+    pub unpause_requested_at: Option<i64>,
+    pub unpause_delay: i64,  // e.g., 3600 = 1 hour
+    // ...
+}
+
+pub fn request_unpause(ctx: Context<RequestUnpause>) -> Result<()> {
+    require!(ctx.accounts.protocol.paused, ErrorCode::NotPaused);
+    ctx.accounts.protocol.unpause_requested_at = Some(Clock::get()?.unix_timestamp);
+    Ok(())
+}
+
+pub fn execute_unpause(ctx: Context<ExecuteUnpause>) -> Result<()> {
+    let protocol = &mut ctx.accounts.protocol;
+
+    let requested_at = protocol.unpause_requested_at
+        .ok_or(ErrorCode::UnpauseNotRequested)?;
+
+    let elapsed = Clock::get()?.unix_timestamp - requested_at;
+    require!(elapsed >= protocol.unpause_delay, ErrorCode::UnpauseDelayNotMet);
+
+    protocol.paused = false;
+    protocol.unpause_requested_at = None;
+
+    Ok(())
+}
+```
+
+The delay gives time for the community to react if the unpause is premature. It also prevents an attacker who compromises admin keys from immediately unpausing to continue an exploit.
+
+### Gradual Resume
+
+Instead of instantly resuming full functionality, ease back in:
+
+```rust
+pub fn unpause_to_cautious(ctx: Context<Unpause>) -> Result<()> {
+    let protocol = &mut ctx.accounts.protocol;
+    require!(protocol.mode == ProtocolMode::Emergency, ErrorCode::WrongMode);
+
+    // Don't go straight to Normal - ease back
+    protocol.mode = ProtocolMode::Cautious;
+
+    emit!(ModeChange {
+        from: ProtocolMode::Emergency,
+        to: ProtocolMode::Cautious,
+    });
+
+    Ok(())
+}
+```
+
+This lets you test that everything is working correctly with reduced risk before returning to full operation.
+
+<ArticleSection name="The Tradeoff: Safety vs Availability" id="tradeoffs" level="h2" />
+
+Circuit breakers have a cost. Every pause:
+
+- **Frustrates legitimate users** who can't access their funds
+- **Creates uncertainty**: is my money safe?
+- **May cause secondary problems**: users who needed to add collateral can't, leading to liquidations when you unpause
+- **Damages trust** if used too frequently
+
+### The User Perspective
+
+Imagine you deposited collateral this morning. The market drops. You need to add more collateral to avoid liquidation. You go to the protocol and see: "Protocol paused due to unusual market conditions."
+
+Your position is frozen. You can't add collateral. When the protocol unpauses, you might be liquidated for something you could have prevented.
+
+This is why some protocols exempt certain actions from pauses:
+
+```rust
+pub fn add_collateral(ctx: Context<AddCollateral>, amount: u64) -> Result<()> {
+    // Allow adding collateral even when paused
+    // This only helps users, never hurts the protocol
+    // ...
+}
+
+pub fn withdraw_collateral(ctx: Context<WithdrawCollateral>, amount: u64) -> Result<()> {
+    // This is restricted during pause
+    require!(!ctx.accounts.protocol.paused, ErrorCode::ProtocolPaused);
+    // ...
+}
+```
+
+Adding collateral is always safe: it only improves positions. Withdrawing collateral is risky during uncertain conditions.
+
+### Finding the Balance
+
+**Pause thresholds should be calibrated to your protocol's risk tolerance:**
+
+- High TVL, institutional users: More conservative, pause earlier
+- Lower TVL, degen users: More tolerant of volatility, pause later
+- Stablecoin pools: Very tight thresholds (small moves are abnormal)
+- Volatile asset pools: Looser thresholds (big moves are normal)
+
+**Communication matters as much as the pause itself:**
+
+```rust
+emit!(ProtocolPaused {
+    timestamp: Clock::get()?.unix_timestamp,
+    reason: "Unusual oracle behavior detected on SOL/USD feed",
+    expected_duration: "Assessing situation, update in 30 minutes",
+    user_action: "No action required. Positions are safe.",
+});
+```
+
+Users panic less when they understand what's happening and why.
+
+<ArticleSection name="Implementation Checklist" id="checklist" level="h2" />
+
+### 1. Define Your Triggers
+
+Before writing code, decide what conditions warrant a pause:
+
+| Condition | Trigger Threshold | Pause Scope |
+|-----------|------------------|-------------|
+| Price move | >30% in 5 min | Per-market |
+| Oracle staleness | >60 seconds | Per-market |
+| Liquidation rate | >50 in 5 min | Liquidations only |
+| TVL drop | >25% in 1 hour | Global |
+| Admin detection | Manual | Flexible |
+
+### 2. Implement Granular Controls
+
+```rust
+#[account]
+pub struct Market {
+    // Granular pause flags
+    pub deposits_paused: bool,
+    pub withdrawals_paused: bool,
+    pub borrows_paused: bool,
+    pub repays_paused: bool,
+    pub liquidations_paused: bool,
+
+    // Automatic trigger state
+    pub last_price: u64,
+    pub last_price_time: i64,
+    pub liquidations_this_window: u64,
+    pub window_start: i64,
+
+    // ...
+}
+```
+
+### 3. Add Automatic Detection
+
+Every price update, every liquidation, every large transaction should check circuit breaker conditions.
+
+### 4. Test Your Triggers
+
+Simulate extreme conditions in your test suite:
+
+```rust
+#[test]
+fn test_price_circuit_breaker_triggers() {
+    // Setup market with price at $100
+    // Simulate price jumping to $150 (50% increase)
+    // Assert circuit breaker triggered
+    // Assert correct pause scope
+}
+
+#[test]
+fn test_liquidation_cascade_detection() {
+    // Simulate 100 liquidations in 5 minutes
+    // Assert liquidations paused
+    // Assert other operations continue
+}
+```
+
+### 5. Plan for Communication
+
+Have templates ready for pause announcements. In an emergency, you don't want to be writing comms from scratch.
+
+### 6. Document Recovery Procedures
+
+Before you need them, write down:
+- Who can pause and unpause?
+- What's the unpause process?
+- What checks must pass before resuming?
+- Who needs to be notified?
+
+<ArticleSection name="Real-World Examples" id="examples" level="h2" />
+
+### Compound's Guardian
+
+Compound has a "pause guardian" address that can pause borrowing on any market. During the March 2020 crash, this allowed them to pause markets for assets with unreliable oracle data while keeping the rest of the protocol running.
+
+### Aave's Emergency Mode
+
+Aave has multiple emergency admin roles with different capabilities. Their "Emergency Admin" can pause the protocol, but only the full governance process can change interest rate parameters or add new assets. This separation limits damage from compromised keys.

@@ -1,0 +1,270 @@
+import { ArticleSection } from "../../../../components/ArticleSection/ArticleSection";
+
+# Liquidity Provision
+
+AMMs need liquidity to trade against. Those tokens come from liquidity providers who deposit assets to earn trading fees; this means that without LPs, there would be no liquidity and without liquidity, there's no DeFi.
+
+LP tokens represent your share of a pool: Deposit SOL and USDC, receive LP tokens in weighted capacity that you can burn to withdraw your proportional share of whatever's in the pool.
+
+Simple concept. But the math hides complexity that catches most developers off guard: impermanent loss, first depositor attacks, and sandwich exploits.
+
+<ArticleSection name="LP Token Mechanics" id="lp-mechanics" level="h2" />
+
+As explained before, LP tokens represent your deposit of 100 SOL and 10,000 USDC into a pool. 
+
+Six months later, when you finally want your tokens back, you could find that the pool now has 150 SOL and 8,000 USDC from trading activity. How do you know what's yours?
+
+LP tokens solve this. They're a claim on a proportional share of the pool; not specific tokens, but a percentage of whatever's there. 
+
+If you hold 10% of LP tokens, you can redeem them for 10% of each token in the pool.
+
+```rust
+#[account]
+pub struct Pool {
+    pub reserve_a: u64,
+    pub reserve_b: u64,
+    pub lp_supply: u64,  // Total LP tokens minted
+    // ...
+}
+
+// Your share
+let your_share = your_lp_tokens as u128 * PRECISION / pool.lp_supply as u128;
+
+// What you can redeem
+let your_token_a = (pool.reserve_a as u128 * your_share / PRECISION) as u64;
+let your_token_b = (pool.reserve_b as u128 * your_share / PRECISION) as u64;
+```
+
+### Initial Mint: 1:1 Deposits
+
+The first deposit is special. There's no existing ratio to match. How many LP tokens should you get?
+
+The simplest approach: mint LP tokens equal to the total value deposited. For a single-asset vault, this is straightforward:
+
+```rust
+pub fn initial_mint(amount: u64) -> u64 {
+    // First depositor gets LP tokens equal to their deposit
+    amount
+}
+```
+
+For dual-asset pools, you typically use the total value in a common denomination or simply the sum of deposits scaled appropriately.
+
+This 1:1 approach is intuitive but introduces a critical vulnerability: **inflation attacks**. We'll cover the attack and its mitigations in the exploits section below.
+
+### Subsequent Deposits: Proportional
+
+After the first deposit, new LPs must deposit in the current ratio. The LP tokens they receive are proportional to the smaller of the two deposit ratios:
+
+```rust
+pub fn mint_lp(
+    deposit_a: u64,
+    deposit_b: u64,
+    reserve_a: u64,
+    reserve_b: u64,
+    lp_supply: u64,
+) -> u64 {
+    // Calculate ratio for each token
+    let ratio_a = (deposit_a as u128 * lp_supply as u128) / reserve_a as u128;
+    let ratio_b = (deposit_b as u128 * lp_supply as u128) / reserve_b as u128;
+
+    // Use the smaller ratio (rounds DOWN)
+    std::cmp::min(ratio_a, ratio_b) as u64
+}
+```
+
+Why the minimum? If someone deposits disproportionately, they'd be giving free tokens to the pool. Using the minimum ensures fair pricing and returns excess tokens.
+
+### Burn: Redeem Proportional Share
+
+Burning LP tokens reverses the process:
+
+```rust
+pub fn burn_lp(
+    lp_amount: u64,
+    reserve_a: u64,
+    reserve_b: u64,
+    lp_supply: u64,
+) -> (u64, u64) {
+    // Calculate share of each reserve (round DOWN)
+    let amount_a = (lp_amount as u128 * reserve_a as u128 / lp_supply as u128) as u64;
+    let amount_b = (lp_amount as u128 * reserve_b as u128 / lp_supply as u128) as u64;
+
+    (amount_a, amount_b)
+}
+```
+
+> always round DOWN for both mint and burn. The protocol keeps dust, preventing value extraction through repeated tiny operations.
+
+<ArticleSection name="Impermanent Loss" id="impermanent-loss" level="h2" />
+
+### The Hidden Cost
+
+You deposit $1000 of SOL and $1000 of USDC into a pool. SOL doubles in price. You withdraw. How much do you have?
+
+Not $3000. You have $2828. What happened to the other $172?
+
+This is **impermanent loss**. As price diverges, the pool rebalances. Arbitrageurs buy the cheap asset and sell the expensive one until pool prices match market prices. 
+
+You end up with more of the cheaper asset (USDC) and less of the expensive one (SOL).
+
+```rust
+// Initial: 10 SOL ($100 each) + 1000 USDC = $2000
+// Price doubles: 1 SOL = $200
+
+// If you held (no LP): 10 SOL * $200 + 1000 USDC = $3000
+
+// In the pool (constant product):
+// New reserves after arbitrage: ~7.07 SOL + ~1414 USDC
+// Your value: 7.07 * $200 + $1414 = $2828
+
+// Impermanent loss: ($3000 - $2828) / $3000 = 5.72%
+```
+
+### The Formula
+
+```rust
+// IL = 2 * sqrt(price_ratio) / (1 + price_ratio) - 1
+pub fn calculate_il(initial_price: u128, final_price: u128) -> i128 {
+    let price_ratio = (final_price * PRECISION) / initial_price;
+    let sqrt_ratio = integer_sqrt(price_ratio * PRECISION);
+
+    let numerator = 2 * sqrt_ratio;
+    let denominator = PRECISION + price_ratio;
+
+    // Returns negative value (loss as percentage)
+    (numerator as i128 * PRECISION as i128 / denominator as i128) - PRECISION as i128
+}
+```
+
+IL at different price changes:
+
+| Price Change | Impermanent Loss |
+|--------------|-----------------|
+| 1.25x (25% up) | 0.6% |
+| 1.50x (50% up) | 2.0% |
+| 2x (100% up) | 5.7% |
+| 3x (200% up) | 13.4% |
+| 4x (300% up) | 20.0% |
+| 5x (400% up) | 25.5% |
+
+The loss is "impermanent" because if the price returns to your entry, IL disappears. But if you withdraw while prices diverge, the loss becomes permanent.
+
+### When IL Exceeds Fees
+
+LPs earn trading fees. The question: do fees exceed impermanent loss?
+
+```rust
+// Simple profitability check
+let fees_earned = total_volume * fee_bps / 10_000;
+let il_loss = initial_value * il_percentage;
+
+if fees_earned > il_loss {
+    // Profitable LP position
+}
+```
+
+High volume, stable pairs, tight price ranges = profitable.
+Low volume, volatile pairs, wide price swings = IL dominates.
+
+> Concentrated liquidity amplifies both: more fees per dollar of liquidity, but also more IL in your active range.
+
+<ArticleSection name="LP Exploits & Attacks" id="exploits" level="h2" />
+
+### Inflation Attack (First Depositor Attack)
+
+The first deposit sets the pool's initial ratio and LP token value. With a naive 1:1 mint, an attacker can exploit this through an **inflation attack**:
+
+```rust
+// Attack steps:
+// 1. Be the first depositor with tiny amounts
+let initial_lp = 1;  // 1 LP token for 1 token deposited
+
+// 2. Donate tokens directly to vault (not through deposit)
+// Attacker sends 100,000 tokens to the vault address
+// This inflates the "value per LP token" without minting new LP
+// Now 1 LP token = 100,001 tokens
+
+// 3. Next user deposits normally with 50,000 tokens
+// shares = 50,000 * 1 / 100,001 = 0 (rounds down!)
+// User gets ZERO shares but their tokens are in the vault
+
+// 4. Attacker withdraws their 1 share
+// They receive all 150,001 tokens, stealing user's deposit
+```
+
+The core issue: when the share supply is low, an attacker can inflate the "price per share" through donations, causing subsequent deposits to round down to zero shares.
+
+**Mitigation 1: Dead Shares**
+
+Permanently lock a portion of initial shares to establish a baseline supply that cannot be manipulated:
+
+```rust
+const MINIMUM_LIQUIDITY: u64 = 1000;
+
+pub fn first_deposit(amount: u64) -> Result<u64> {
+    // Mint shares equal to deposit
+    let lp_minted = amount;
+
+    require!(lp_minted > MINIMUM_LIQUIDITY, ErrorCode::InsufficientInitialLiquidity);
+
+    // Lock minimum liquidity forever (mint to burn address or pool itself)
+    let lp_to_user = lp_minted.checked_sub(MINIMUM_LIQUIDITY)
+        .ok_or(ErrorCode::InsufficientInitialLiquidity)?;
+
+    // The MINIMUM_LIQUIDITY shares are "dead" - permanently locked
+    Ok(lp_to_user)
+}
+```
+
+Why does this work? With 1000 locked shares, an attacker would need to donate more than 1000 units worth of tokens to meaningfully inflate the share price. The attacker only owns a fraction of shares, so they can only recover a fraction of their donation. The rest is captured by the dead shares, making the attack unprofitable.
+
+**Mitigation 2: Virtual Shares and Decimal Offset**
+
+An alternative approach uses virtual accounting to increase precision and reduce rounding impacts:
+
+```rust
+const VIRTUAL_SHARES: u128 = 1_000_000_000; // 10^9 virtual shares
+const VIRTUAL_ASSETS: u128 = 1;              // 1 virtual asset
+
+pub fn calculate_shares(deposit: u64, total_assets: u64, total_shares: u64) -> u64 {
+    // Add virtual values to prevent manipulation
+    let adjusted_assets = (total_assets as u128) + VIRTUAL_ASSETS;
+    let adjusted_shares = (total_shares as u128) + VIRTUAL_SHARES;
+
+    // Calculate shares with virtual offset
+    let shares = (deposit as u128) * adjusted_shares / adjusted_assets;
+    shares as u64
+}
+```
+
+The virtual offset creates an implicit exchange rate even when the vault is empty. With `VIRTUAL_SHARES = 10^9` and `VIRTUAL_ASSETS = 1`:
+- Empty vault rate: 10^9 shares per asset
+- A donation attack would need to be massive (10^9 scale) to have any impact
+- The attacker loses most of their donation to the virtual shares they don't own
+
+This approach maintains precision without permanent value lock and offers flexible, tunable parameters, but is more complex to implement correctly.
+
+> For a detailed mathematical analysis of the virtual offset defense, see the [OpenZeppelin ERC-4626 documentation](https://docs.openzeppelin.com/contracts/5.x/erc4626#defending_with_a_virtual_offset).
+
+### Sandwich Attacks
+
+On Solana, validators see pending transactions before execution. An attacker can:
+
+1. **Front-run**: See your swap, execute their swap first to move the price
+2. **Let your swap execute**: At a worse price due to step 1
+3. **Back-run**: Swap back, profiting from the artificial price movement
+
+```
+User submits: Swap 100 SOL for USDC (min_out: 9900 USDC)
+
+Attacker front-runs: Buys USDC, price moves up
+User's swap executes: Gets 9900 USDC (barely meets minimum)
+Attacker back-runs: Sells USDC, captures profit
+
+User lost ~100 USDC to the sandwich
+```
+
+**Mitigations:**
+- Tight slippage tolerance (but too tight = failed transactions)
+- Time-weighted average price (TWAP) for sensitive operations

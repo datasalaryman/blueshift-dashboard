@@ -1,0 +1,472 @@
+import { ArticleSection } from "../../../../components/ArticleSection/ArticleSection";
+
+# Perpetuals & Leverage
+
+In March 2020, Bitcoin dropped 50% in 24 hours. Traders with 100x leverage on BitMEX watched $1 billion in positions get liquidated. The liquidations created more selling, which triggered more liquidations. The exchange went offline for "maintenance" as the cascade spiraled.
+
+This is the world of perpetual futures: instruments so powerful they can multiply your returns 100x, or vaporize your capital in minutes.
+
+Perpetuals are now the dominant way crypto is traded. On most days, perp volume exceeds spot volume by 3-5x. Understanding how they work isn't optional if you're building DeFi.
+
+### What Makes Perpetuals Different
+
+Traditional futures expire. Buy a December SOL future, and in December you either take delivery or settle in cash. The expiry date forces the futures price to converge with spot: you can't have December SOL trading at $200 when spot is $100 on expiration day.
+
+Perpetuals never expire. You can hold a position forever. But this creates a problem: without expiry forcing convergence, what keeps the perpetual price aligned with spot?
+
+The answer is **funding rates**: periodic payments between longs and shorts that create economic pressure toward the real price. We'll dive deep into this mechanism; it's elegant, and getting it wrong can drain your protocol.
+
+<ArticleSection name="The Power and Danger of Leverage" id="leverage-intro" level="h2" />
+
+You think SOL will hit $200. You have $1,000. Buying spot gets you 10 SOL at $100. If SOL hits $200, you have $2,000 - a 100% return. Not bad.
+
+But with 10x leverage, your $1,000 controls $10,000 worth of SOL - 100 SOL of exposure. SOL hits $200, and you've made $10,000 profit on $1,000 margin. That's a 1000% return.
+
+The catch is brutal: SOL drops just 10% to $90, and your entire $1,000 is gone. Liquidated. Your position closes automatically because you no longer have enough margin to cover potential losses.
+
+**Leverage amplifies everything.** This is the single most important thing to understand. Every gain is multiplied. Every loss is multiplied.
+
+```rust
+// The leverage equation
+// $1000 margin, 10x leverage = $10,000 notional exposure
+
+// Price moves +10%:
+// Without leverage: $1,000 * 10% = $100 profit (10% return)
+// With 10x leverage: $10,000 * 10% = $1,000 profit (100% return)
+
+// Price moves -10%:
+// Without leverage: $1,000 * -10% = -$100 loss (10% loss)
+// With 10x leverage: $10,000 * -10% = -$1,000 loss (100% loss = liquidated)
+```
+
+This asymmetry is why perpetual protocols have the most complex risk management in DeFi. 
+
+One miscalculation in liquidation logic, and you're either liquidating users unfairly or accumulating bad debt that bankrupts your protocol.
+
+<ArticleSection name="Position Mechanics" id="position-mechanics" level="h2" />
+
+### Opening a Position
+
+To open a perpetual position, a trader deposits **margin** (collateral) and specifies their desired **size** (exposure) and **direction** (long or short):
+
+```rust
+#[account]
+pub struct Position {
+    pub owner: Pubkey,
+    pub market: Pubkey,
+    pub size: i64,           // Positive = long, negative = short
+    pub entry_price: u64,    // Price when position opened
+    pub margin: u64,         // Collateral deposited
+    pub last_funding_index: i128,  // For funding rate calculations
+}
+
+pub fn open_position(
+    ctx: Context<OpenPosition>,
+    size: i64,
+    margin: u64,
+) -> Result<()> {
+    let market = &ctx.accounts.market;
+    let position = &mut ctx.accounts.position;
+
+    let mark_price = get_mark_price(market)?;
+
+    // Notional = size * price (the total exposure)
+    let notional = (size.abs() as u128 * mark_price as u128 / PRICE_PRECISION) as u64;
+
+    // Check leverage: notional / margin must not exceed max
+    let leverage = notional * PRECISION / margin;
+    require!(leverage <= market.max_leverage, ErrorCode::ExcessiveLeverage);
+
+    // Check minimum margin requirement
+    let required_margin = notional * market.initial_margin_bps as u64 / 10_000;
+    require!(margin >= required_margin, ErrorCode::InsufficientMargin);
+
+    position.owner = ctx.accounts.owner.key();
+    position.market = market.key();
+    position.size = size;
+    position.entry_price = mark_price;
+    position.margin = margin;
+    position.last_funding_index = market.cumulative_funding_index;
+
+    transfer(/* owner -> vault */, margin)?;
+
+    Ok(())
+}
+```
+
+### PnL: Where Money Is Made and Lost
+
+Profit and loss is simple in concept: how much did the price move since you entered?
+
+```rust
+pub fn calculate_pnl(position: &Position, current_price: u64) -> i64 {
+    // PnL = size * (current_price - entry_price)
+    let price_diff = current_price as i64 - position.entry_price as i64;
+    position.size * price_diff / PRICE_PRECISION as i64
+}
+```
+
+The sign of `size` handles long vs short automatically:
+
+```rust
+// Long 10 SOL at $100, price goes to $110
+let pnl = 10 * (110 - 100);  // +$100 profit
+
+// Short 10 SOL at $100, price goes to $90
+let pnl = -10 * (90 - 100);  // -10 * -10 = +$100 profit
+
+// Long 10 SOL at $100, price drops to $90
+let pnl = 10 * (90 - 100);   // -$100 loss
+```
+
+But PnL isn't the whole story. Funding payments accumulate over time, eating into (or adding to) your returns. A position can be profitable on price but underwater after funding.
+
+### Closing a Position
+
+When closing, the trader receives their original margin plus any PnL, minus funding payments owed. If losses exceed margin, there's nothing left to return.
+
+```rust
+pub fn close_position(ctx: Context<ClosePosition>) -> Result<()> {
+    let market = &ctx.accounts.market;
+    let position = &mut ctx.accounts.position;
+
+    let mark_price = get_mark_price(market)?;
+    let pnl = calculate_pnl(position, mark_price);
+    let funding = calculate_funding_payment(position, market)?;
+
+    // What you get back: margin + pnl - funding owed
+    let final_balance = (position.margin as i64 + pnl - funding) as u64;
+
+    if final_balance > 0 {
+        transfer(/* vault -> owner */, final_balance)?;
+    }
+
+    position.size = 0;
+    position.margin = 0;
+
+    Ok(())
+}
+```
+
+<ArticleSection name="The Margin System" id="margin-system" level="h2" />
+
+Margin is your skin in the game: the collateral that backs your leveraged position. Get the margin math wrong, and you either liquidate users too aggressively (they'll leave) or too slowly (you'll accumulate bad debt).
+
+### Initial vs Maintenance Margin
+
+**Initial margin** is what you need to open a position. For 10x max leverage, that's 10% of notional.
+
+```rust
+const MAX_LEVERAGE: u64 = 10;
+const INITIAL_MARGIN_BPS: u64 = 1000;  // 10%
+
+// $10,000 position requires $1,000 initial margin
+let required = 10_000 * 1000 / 10_000;  // $1,000
+```
+
+**Maintenance margin** is the minimum to keep a position open, typically lower than initial margin to give traders some breathing room before liquidation.
+
+```rust
+const MAINTENANCE_MARGIN_BPS: u64 = 500;  // 5%
+
+// $10,000 position, maintenance margin = $500
+// Below $500 equity = liquidatable
+```
+
+The gap between initial (10%) and maintenance (5%) means a trader can open a position and immediately be "safe" from liquidation as long as the price doesn't move too much. 
+
+This buffer prevents positions from being liquidated the moment they're opened due to small price fluctuations.
+
+### Margin Ratio: The Health Check
+
+The margin ratio tells you how close a position is to liquidation:
+
+```rust
+pub fn calculate_margin_ratio(position: &Position, mark_price: u64) -> u64 {
+    let pnl = calculate_pnl(position, mark_price);
+    let funding = calculate_pending_funding(position)?;
+
+    // Equity = what the trader actually has
+    let equity = position.margin as i64 + pnl - funding;
+    if equity <= 0 {
+        return 0;  // Already underwater
+    }
+
+    let notional = (position.size.abs() as u128 * mark_price as u128 / PRICE_PRECISION) as u64;
+
+    // margin_ratio = equity / notional
+    (equity as u64 * PRECISION) / notional
+}
+```
+
+When `margin_ratio < maintenance_margin_bps`, the position can be liquidated. This is the number that traders watch obsessively during volatile markets.
+
+### Cross vs Isolated Margin: A Critical Design Choice
+
+**Isolated margin**: Each position has its own collateral. Get liquidated on one position, your other positions are safe.
+
+```rust
+pub struct IsolatedPosition {
+    pub margin: u64,  // Only this margin at risk
+    pub size: i64,
+    // ...
+}
+```
+
+**Cross margin**: All positions share your account balance as collateral. More capital efficient (profitable positions offset losing ones), but one bad trade can wipe everything.
+
+```rust
+pub struct CrossMarginAccount {
+    pub balance: u64,  // Shared across all positions
+    pub positions: Vec<Position>,
+}
+
+pub fn calculate_cross_margin_health(account: &CrossMarginAccount, prices: &[u64]) -> u64 {
+    let total_pnl: i64 = account.positions.iter()
+        .zip(prices.iter())
+        .map(|(pos, price)| calculate_pnl(pos, *price))
+        .sum();
+
+    let total_notional: u64 = account.positions.iter()
+        .zip(prices.iter())
+        .map(|(pos, price)| (pos.size.abs() as u128 * *price as u128 / PRICE_PRECISION) as u64)
+        .sum();
+
+    let equity = account.balance as i64 + total_pnl;
+
+    if equity <= 0 || total_notional == 0 {
+        return 0;
+    }
+
+    (equity as u64 * PRECISION) / total_notional
+}
+```
+
+Cross margin is more complex to implement but traders love it. Most major perp DEXs support both modes.
+
+<ArticleSection name="Funding Rates: The Price Anchor" id="funding-rate" level="h2" />
+
+Here's a puzzle: SOL spot is trading at $100. SOL perpetual is trading at $105. Why would anyone buy the perp at a 5% premium?
+
+Answer: They wouldn't, for long. Funding rates make holding that overpriced long expensive.
+
+### How Funding Works
+
+Every 8 hours (or continuously in some protocols), funding payments flow between longs and shorts:
+
+- **Perp > Spot**: Longs pay shorts. This makes longing expensive and shorting profitable, pushing perp price down toward spot.
+- **Perp < Spot**: Shorts pay longs. This makes shorting expensive and longing profitable, pushing perp price up toward spot.
+
+```rust
+pub fn calculate_funding_rate(mark_price: u64, index_price: u64) -> i64 {
+    // funding_rate = (mark - index) / index * scaling_factor
+    let price_diff = mark_price as i64 - index_price as i64;
+    price_diff * FUNDING_FACTOR / index_price as i64
+    // Positive = longs pay shorts
+    // Negative = shorts pay longs
+}
+```
+
+### A Concrete Example
+
+SOL perp is at $105, spot at $100. That's a 5% premium.
+
+```rust
+// Funding rate calculation (simplified)
+// (105 - 100) / 100 = 5% per funding period
+
+// If you're long 100 SOL at $105 = $10,500 notional
+// You pay: $10,500 * 5% = $525 to shorts every 8 hours
+
+// That's $1,575 per day just to hold the position!
+```
+
+At these rates, longs close their positions or new shorts open to collect the funding. Both actions push the perp price back toward spot. The market self-corrects.
+
+### The Funding Accumulator Pattern
+
+Like interest in lending protocols, we don't update every position on every funding tick. That would be impossibly expensive. Instead, we use a cumulative index:
+
+```rust
+#[account]
+pub struct Market {
+    pub cumulative_funding_index: i128,  // Running total
+    pub last_funding_time: i64,
+}
+
+pub fn update_funding(market: &mut Market, mark_price: u64, index_price: u64) -> Result<()> {
+    let time_elapsed = Clock::get()?.unix_timestamp - market.last_funding_time;
+    if time_elapsed < FUNDING_INTERVAL {
+        return Ok(());
+    }
+
+    let rate = calculate_funding_rate(mark_price, index_price);
+    let funding_delta = rate * time_elapsed / FUNDING_PERIOD;
+
+    market.cumulative_funding_index += funding_delta as i128;
+    market.last_funding_time = Clock::get()?.unix_timestamp;
+
+    Ok(())
+}
+```
+
+When a position opens, it snapshots the current index. To calculate funding owed:
+
+```rust
+pub fn calculate_funding_payment(position: &Position, market: &Market) -> i64 {
+    let funding_delta = market.cumulative_funding_index - position.last_funding_index;
+    position.size * funding_delta / PRECISION as i64
+}
+```
+
+### Funding Rate Manipulation: A Real Attack Vector
+
+In March 2023, an attacker on Mango Markets manipulated the funding rate by:
+1. Opening a massive long position
+2. Pumping the perp price (thin order book)
+3. Funding rate spiked to 100%+ annualized
+4. Closing the long, opening a short
+5. Collecting massive funding from trapped longs
+
+**Mitigations:**
+- Cap funding rates at reasonable bounds
+- Use TWAP (time-weighted average) for funding calculation
+- Require minimum time for funding to accrue
+- Limit position sizes relative to open interest
+
+<ArticleSection name="Mark Price vs Index Price" id="mark-index" level="h2" />
+
+### Why Two Prices?
+
+**Index price**: The "true" spot price from oracles (Pyth, Switchboard). This is what SOL is actually trading for on spot markets.
+
+**Mark price**: Used for PnL calculations and liquidations. Often smoothed or dampened to resist manipulation.
+
+Why separate them? Consider this nightmare scenario:
+
+A flash crash drops SOL from $100 to $50 for 30 seconds: maybe a fat finger trade or maybe thin liquidity on one exchange. 
+
+If liquidations triggered on raw spot price, thousands of positions would be liquidated instantly. If thirty seconds later, the price recovers to $98, those traders lost everything to a 30-second "glitch".
+
+```rust
+// Simple mark price: weighted blend
+pub fn calculate_mark_price(index_price: u64, perp_price: u64) -> u64 {
+    (index_price * 7 + perp_price * 3) / 10
+}
+
+// Better: use TWAP
+pub fn calculate_mark_twap(price_samples: &[u64]) -> u64 {
+    price_samples.iter().sum::<u64>() / price_samples.len() as u64
+}
+```
+
+Mark price protection saves traders from:
+- Flash crashes
+- Oracle manipulation
+- Thin order book exploitation
+
+But it introduces its own risks. If mark price diverges too far from reality, traders can be in profit on screen but underwater when they try to close.
+
+<ArticleSection name="Liquidations" id="liquidations" level="h2" />
+
+When a position's margin ratio falls below maintenance requirements, it must be liquidated. Someone else closes the position, and the remaining margin (if any) covers the losses.
+
+### Liquidation Price
+
+Traders want to know: at what price do I get liquidated?
+
+```rust
+pub fn calculate_liquidation_price(position: &Position, maintenance_margin_bps: u64) -> u64 {
+    let margin = position.margin as i128;
+    let size = position.size.abs() as i128;
+    let entry = position.entry_price as i128;
+    let mm = maintenance_margin_bps as i128;
+
+    if position.size > 0 {
+        // Long: liquidated when price drops
+        let numerator = size * entry - margin * 10_000;
+        let denominator = size * (10_000 - mm);
+        (numerator / denominator) as u64
+    } else {
+        // Short: liquidated when price rises
+        let numerator = size * entry + margin * 10_000;
+        let denominator = size * (10_000 + mm);
+        (numerator / denominator) as u64
+    }
+}
+```
+
+### The Insurance Fund
+
+Sometimes positions are liquidated below zero. The trader's margin is gone, but there's still debt. This is **bad debt**, and someone has to pay.
+
+The insurance fund absorbs these losses:
+
+```rust
+pub fn liquidate(ctx: Context<Liquidate>) -> Result<()> {
+    let position = &mut ctx.accounts.position;
+    let market = &mut ctx.accounts.market;
+
+    let pnl = calculate_pnl(position, market.mark_price);
+    let funding = calculate_funding_payment(position, market);
+    let remaining = position.margin as i64 + pnl - funding;
+
+    if remaining < 0 {
+        // Bad debt: insurance fund covers the difference
+        let bad_debt = (-remaining) as u64;
+        market.insurance_fund = market.insurance_fund.saturating_sub(bad_debt);
+    }
+
+    // Pay liquidator their bonus for keeping the system healthy
+    let bonus = position.size.abs() as u64 * market.liq_bonus_bps as u64 / 10_000;
+    transfer(/* vault -> liquidator */, bonus)?;
+
+    position.size = 0;
+    position.margin = 0;
+
+    Ok(())
+}
+```
+
+### Liquidation Cascades: The Death Spiral
+
+Remember that March 2020 crash? Here's what happens:
+
+```
+Market drops 5%
+→ 20x leveraged longs hit liquidation price
+→ Liquidations execute as market sells
+→ Selling pressure drops price another 3%
+→ 15x leveraged longs now liquidatable
+→ More liquidations, more selling
+→ 10x longs liquidated
+→ Cascade continues until buying absorbs the pressure
+```
+
+This is why high leverage is dangerous at scale. One person's 50x long is their problem. A million users' 50x longs is a systemic risk.
+
+**Mitigations:**
+- Lower maximum leverage (Solana perps often cap at 10-20x vs 100x elsewhere)
+- Gradual liquidation (close 25% at a time)
+- Circuit breakers that pause liquidations during extreme moves
+- Open interest limits
+
+### ADL: The Nuclear Option
+
+When the insurance fund is depleted, losses must be **socialized**. Auto-deleveraging (ADL) forces profitable positions to close against underwater positions.
+
+```rust
+pub fn calculate_adl_priority(position: &Position, mark_price: u64) -> u64 {
+    let pnl = calculate_pnl(position, mark_price);
+    if pnl <= 0 {
+        return 0;  // Only profitable positions are ADL candidates
+    }
+
+    let margin_ratio = calculate_margin_ratio(position, mark_price);
+
+    // Higher profit + higher leverage = first to be ADL'd
+    pnl as u64 * PRECISION / margin_ratio
+}
+```
+
+ADL is the last resort. It means profitable traders have winning positions forcibly closed. Traders hate it. But it's better than the protocol going insolvent.

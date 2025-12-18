@@ -1,0 +1,231 @@
+import { ArticleSection } from "../../../../components/ArticleSection/ArticleSection";
+
+# DeFi Math Essentials
+
+You might know how to write Solana programs. You understand accounts, PDAs, CPIs but the moment you try to build DeFi, you'll discover that most exploits aren't caused by missing signer checks or account validation bugs.
+
+They're caused by math.
+
+One miscalculated decimal, one wrong rounding direction, and attackers drain millions. 
+
+Math precision is the #1 source of DeFi exploits, and it's not because developers are bad at math; it's because blockchain math works differently than what you're used to.
+
+<ArticleSection name="The Precision Problem" id="precision-problem" level="h2" />
+
+### No Floats On Chain
+
+Solana programs should not use floating-point numbers. No `f32`, no `f64`.
+
+Floating-point arithmetic is non-deterministic across different hardware. The same calculation might produce slightly different results on different validators.
+
+So we must use integers. But how do you represent `0.5 SOL` with integers?
+
+```rust
+// This is how tokens work on Solana
+let amount_in_lamports: u64 = 500_000_000; // 0.5 SOL
+let sol_decimals: u8 = 9;
+
+// To get the "human readable" value:
+// 500_000_000 / 10^9 = 0.5 SOL
+```
+
+Every token has a decimal count; SOL has 9 decimals (the smallest part called lamport), USDC has 6. When you see "1 USDC" in a wallet, the on-chain value is actually `1_000_000`.
+
+### Fixed Point Arithmetic
+
+Not being able to use floating point creates other problems: for example, if you need to calculate a user's 33.33% share of a 1000 token pool:
+
+```rust
+let share = 1000 * 33 / 100;  // = 330, not 333.33
+```
+
+You just lost 3.33 tokens to truncation. 
+
+That's 0.33% of the pool gone in a single calculation; At $10M TVL, that's $33,000 vanishing that multiplied by thousands of daily transactions means you've just built a protocol that bleeds value.
+
+By using just fixed-point arithmetic we solve this by scaling up before operations, preserving the decimals that integer division would destroy:
+
+```rust
+const PRECISION: u128 = 1_000_000_000; // 10^9
+
+// Calculate 33.33% of 1000 with precision
+let percentage = 333_333_333u128; // 0.3333... * PRECISION
+let amount = 1000u128;
+
+let result = (amount * percentage) / PRECISION;
+// result = 333 - we preserved the decimal places
+```
+
+The pattern: multiply by `PRECISION` to work in "decimal space," then divide at the end to return to normal integers.
+
+Common precision constants you'll see in DeFi:
+
+| Constant | Value | Use Case |
+|----------|-------|----------|
+| `BPS` | 10,000 | Fee percentages (1 BPS = 0.01%) |
+| `PRECISION` | 10^9 or 10^18 | General calculations |
+| Token decimals | 6-9 | Token amounts |
+
+> When mixing tokens with different decimals (like SOL and USDC), normalize to a common precision first. Forgetting this is a classic exploit vector.
+
+<ArticleSection name="The Golden Rule of Rounding" id="golden-rule" level="h2" />
+
+Even when using the right precision, it's almost impossible not to give out some tokens to rounding.
+
+This is completely fine, the main question would be: who loses in that situation?
+
+Consider this deposit function that rounds in the user's favor:
+
+```rust
+pub fn deposit(amount: u64, total_shares: u64, total_assets: u64) -> u64 {
+    // Round UP - user gets more shares
+    let shares = (amount * total_shares + total_assets - 1) / total_assets;
+    shares
+}
+```
+
+An attacker exploits this:
+
+1. Deposit 1 lamport
+2. Math: `(1 * 1000 + 999) / 1000 = 1` share (should be 0.001)
+3. Withdraw that 1 share
+4. Math: `(1 * 1000) / 1000 = 1` lamports back... but wait
+
+The attacker repeated this millions of times in a loop. Each iteration, the rounding error compounds. The protocol slowly bleeds value until it's drained.
+
+**The fix is the golden rule: round so the protocol keeps more value, never less.**
+
+As much as this could appear as greediness, it's just about making attacks unprofitable. 
+
+When rounding favors the protocol, the attacker loses gas fees on each iteration while gaining nothing.
+
+### Rounding Direction by Operation
+
+| Operation | Direction | Why |
+|-----------|-----------|-----|
+| Mint LP tokens/shares | DOWN | Give user fewer shares |
+| Burn LP for assets | DOWN | Give user fewer assets |
+| Swap output | DOWN | Give user fewer tokens |
+| Fees charged | UP | Take more from user |
+| Debt on borrow | UP | User owes more |
+| Repayment required | UP | User pays more |
+| Interest accrued | UP | Protocol earns more |
+| Collateral value | DOWN | Less borrowing power |
+| Health factor | DOWN | Liquidation triggers sooner |
+
+### Implementation
+
+Round DOWN is the default in Rust. Integer division truncates toward zero:
+
+```rust
+// Round DOWN (default behavior)
+let shares = (deposit * total_shares) / total_assets;
+```
+
+Round UP requires a trick. Add `(divisor - 1)` before dividing:
+
+```rust
+// Round UP
+let debt = (borrow * total_debt + total_shares - 1) / total_shares;
+```
+
+Why does this work? Adding `divisor - 1` ensures any remainder pushes the result to the next integer:
+
+- `7 / 3 = 2` (truncates 0.33)
+- `(7 + 2) / 3 = 9 / 3 = 3` (remainder captured)
+
+Here's a helper function you'll use constantly:
+
+```rust
+/// Divide with rounding up
+pub fn div_ceil(numerator: u128, denominator: u128) -> u128 {
+    (numerator + denominator - 1) / denominator
+}
+```
+
+<ArticleSection name="Safe Math" id="safe-math" level="h2" />
+
+### Overflow Protection
+
+DeFi deals with large numbers. A pool with $100M in TVL using 18 decimal precision can overflow `u64` easily. Always use `checked_*` operations:
+
+```rust
+// Bad: can overflow silently in release builds
+let result = a * b / c;
+
+// Good: explicit overflow handling
+let result = a
+    .checked_mul(b)?
+    .checked_div(c)?;
+```
+
+For intermediate calculations, use `u128`:
+
+```rust
+// Token amounts are u64, but intermediate math needs u128
+let shares: u64 = ((deposit as u128)
+    .checked_mul(total_shares as u128)?
+    .checked_div(total_assets as u128)?) as u64;
+```
+
+> Rust's standard arithmetic operators overflow silently in release builds. Your tests pass, your mainnet deployment wraps `u64::MAX + 1` to `0`, and your protocol is drained. Always use `checked_*` operations in production code.
+
+### Order of Operations
+
+Using the right mental models and safe math isn't everything; ordering is key as well.
+
+Watch what happens with different ordering:
+
+```rust
+// Division first
+let result = (7 / 3) * 100;  // = 2 * 100 = 200
+
+// Multiplication first
+let result = (7 * 100) / 3;  // = 700 / 3 = 233
+```
+
+Same inputs. 16% difference in output. The division-first approach destroyed precision before multiplication could preserve it.
+
+**The rule: multiply before you divide.** Every division truncates. Delay it as long as possible.
+
+But watch for overflow. If `a * b` might overflow, you need `u128`:
+
+```rust
+// Safe: expand to u128, multiply, divide, then truncate back
+let result = (u128::from(a) * u128::from(b) / u128::from(c)) as u64;
+```
+
+<ArticleSection name="Key Formulas Preview" id="key-formulas" level="h2" />
+
+Here are the core formulas you'll implement throughout this course. Don't worry about understanding them yet. We'll break each one down in its respective lesson.
+
+### AMM Swap (Constant Product)
+
+```rust
+// How many tokens out for tokens in?
+// dy = (y * dx) / (x + dx)
+let output = (reserve_out * amount_in) / (reserve_in + amount_in);
+```
+
+### LP Token Mint
+
+```rust
+// First deposit: geometric mean
+let initial_shares = (amount_a * amount_b).integer_sqrt();
+
+// Subsequent deposits: proportional
+let shares = min(
+    (amount_a * total_shares) / reserve_a,
+    (amount_b * total_shares) / reserve_b,
+);
+```
+
+### Lending Health Factor
+
+```rust
+// Health below 1.0 = liquidatable
+// health = (collateral_value * liquidation_threshold) / debt_value
+let health = (collateral * threshold) / debt;
+```
+
+Each formula has specific rounding requirements that we'll cover in their respective lessons.
