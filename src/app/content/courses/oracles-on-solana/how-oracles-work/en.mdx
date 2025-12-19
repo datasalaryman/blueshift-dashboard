@@ -1,0 +1,255 @@
+import { ArticleSection } from "../../../../components/ArticleSection/ArticleSection";
+
+# How Oracles Work
+
+If you haven't read the [Oracle lesson in the Introduction to DeFi course](/courses/introduction-to-defi/oracles), start there. It covers why oracles matter and how to use them safely. This course goes deeper into how oracles actually work under the hood.
+
+The fundamental challenge: blockchains are deterministic. Every validator must be able to re-execute every transaction and get the same result. But "what's the price of SOL right now?" has a different answer depending on when and where you ask.
+
+Oracles solve this by having trusted parties agree on external data and publish it on-chain. The hard part is making that agreement trustworthy.
+
+<ArticleSection name="The Consensus Problem" id="consensus-problem" level="h2" />
+
+### Why Can't We Just Fetch Prices?
+
+A Solana program can't make HTTP requests. It can't call Coinbase's API or scrape Binance's order book. Everything a program reads must already be on-chain.
+
+But even if we could fetch external data, there's a deeper problem: different validators would get different answers.
+
+```
+Validator A queries Coinbase at 12:00:00.001 → SOL = $100.00
+Validator B queries Coinbase at 12:00:00.002 → SOL = $100.02
+Validator C queries Binance instead → SOL = $99.98
+```
+
+The blockchain breaks. Validators can't agree on state. Consensus fails.
+
+Oracles solve this by having external parties publish data to on-chain accounts *before* your program runs. By the time your program executes, the price is just bytes in an account: deterministic and identical for every validator.
+
+### Trust in Oracles
+
+If a single party publishes prices, you're trusting that party completely. They could:
+- Publish wrong prices (accidentally or maliciously)
+- Stop publishing (oracle goes offline)
+- Front-run your protocol (see what transactions are pending, adjust price to profit)
+
+The oracle problem is fundamentally about minimizing this trust. Different oracle networks take different approaches.
+
+<ArticleSection name="Data Aggregation" id="data-aggregation" level="h2" />
+
+### Multiple Sources, One Price
+
+No single exchange has the "true" price. SOL/USD trades on dozens of venues with slightly different prices at any moment. Oracle networks aggregate these into a single number.
+
+The simplest approach: median.
+
+```rust
+// 5 data sources report: [$100.00, $100.02, $99.98, $100.01, $85.00]
+// The $85.00 is probably wrong (stale, manipulated, or error)
+
+fn calculate_median(mut prices: Vec<u64>) -> u64 {
+    prices.sort();
+    let mid = prices.len() / 2;
+    
+    if prices.len() % 2 == 0 {
+        (prices[mid - 1] + prices[mid]) / 2
+    } else {
+        prices[mid]
+    }
+}
+
+// Median: $100.00 (the outlier is ignored)
+```
+
+Median is robust - a single bad source doesn't corrupt the result. But it's also slow to react if most sources are stale.
+
+More sophisticated approaches weight sources by:
+- **Recency**: Fresher data gets more weight
+- **Volume**: Higher-volume exchanges are harder to manipulate
+- **Historical accuracy**: Sources that have been reliable get more trust
+
+### Confidence Intervals
+
+A single price number hides uncertainty. When sources disagree, that disagreement is information.
+
+```rust
+pub struct AggregatedPrice {
+    pub price: i64,       // Best estimate
+    pub conf: u64,        // Uncertainty range
+    pub num_sources: u8,  // How many sources contributed
+}
+```
+
+If 10 sources all report $100.00 ± $0.01, confidence is tight. If 5 sources report $100 and 5 report $95, confidence is wide - something is wrong, and the oracle is telling you it's uncertain.
+
+**Your protocol should check confidence.** Wide confidence during the Mango exploit was a signal that the MNGO price was being manipulated. The oracle was uncertain. Mango's code didn't check.
+
+<ArticleSection name="Push vs Pull Models" id="push-pull" level="h2" />
+
+Oracles get data on-chain in two fundamentally different ways.
+
+### Push Model
+
+Publishers send price updates to the blockchain on a schedule (every second, every block, etc.) regardless of whether anyone needs them.
+
+```
+Publisher → Transaction → On-chain Account (runs continuously)
+```
+
+**Pros:**
+- Prices are always available when you need them
+- No extra work for your protocol
+- Low latency (data is already there)
+
+**Cons:**
+- Someone pays for all those transactions (publisher or oracle network)
+- Most updates are never used
+- Expensive for many price feeds
+
+### Pull Model
+
+Prices are published only when requested. Your transaction includes a "refresh price" instruction before using the data.
+
+```
+Your Transaction:
+1. Call oracle to update price
+2. Read updated price
+3. Execute your logic
+```
+
+**Pros:**
+- Only pay for prices you actually use
+- Scales to many more price feeds
+- Fresher data (updated at moment of use)
+
+**Cons:**
+- Extra complexity in your transaction
+- Higher compute/transaction size
+- If update fails, your transaction fails
+
+### Hybrid Approaches
+
+Modern oracle networks often combine both:
+- High-value feeds (SOL/USD, BTC/USD) are pushed frequently
+- Long-tail feeds are pull-only
+- Anyone can trigger an update, but the oracle network also pushes periodically
+
+<ArticleSection name="Update Frequency and Staleness" id="frequency-staleness" level="h2" />
+
+### The Freshness Tradeoff
+
+More frequent updates = fresher prices = higher costs.
+
+| Update Frequency | Staleness Risk | Cost | Use Case |
+|-----------------|----------------|------|----------|
+| Every block (~400ms) | Minimal | Very high | HFT, arbitrage |
+| Every second | Low | High | Perps, liquidations |
+| Every 30 seconds | Moderate | Medium | Lending collateral |
+| Every 5 minutes | High | Low | Reference only |
+
+Your protocol needs to decide: how stale is too stale?
+
+```rust
+const MAX_STALENESS: i64 = 30; // 30 seconds
+
+pub fn validate_price_freshness(
+    price_timestamp: i64,
+    current_timestamp: i64,
+) -> Result<()> {
+    let age = current_timestamp - price_timestamp;
+    require!(age <= MAX_STALENESS, ErrorCode::StalePriceData);
+    require!(age >= 0, ErrorCode::FuturePriceTimestamp);
+    Ok(())
+}
+```
+
+### Heartbeat vs Deviation-Triggered Updates
+
+Some oracle networks update on a schedule (heartbeat). Others update when the price changes significantly (deviation-triggered).
+
+**Heartbeat** (e.g., every 60 seconds):
+```
+Time:   0s    60s   120s  180s  240s
+Price: $100  $100  $100  $101  $101
+Updates: ✓     ✓     ✓     ✓     ✓
+```
+Predictable, but wasteful when price is stable.
+
+**Deviation-triggered** (e.g., update if price changes >0.5%):
+```
+Time:   0s    60s   120s  180s  240s
+Price: $100  $100  $100  $101  $101
+Updates: ✓                 ✓
+```
+Efficient, but price might be stale during low volatility.
+
+Most production oracles combine both: update on deviation OR if heartbeat exceeded, whichever comes first.
+
+<ArticleSection name="On-Chain Data Structures" id="data-structures" level="h2" />
+
+### Price Account Anatomy
+
+Oracle prices live in regular Solana accounts. The structure varies by provider, but contains similar information:
+
+```rust
+// Conceptual structure (actual implementations vary)
+pub struct PriceFeed {
+    // Identity
+    pub feed_id: [u8; 32],        // Unique identifier for this price pair
+    
+    // Price data
+    pub price: i64,               // Current price (scaled integer)
+    pub conf: u64,                // Confidence interval
+    pub expo: i32,                // Decimal exponent
+    
+    // Timing
+    pub publish_time: i64,        // When publishers submitted this price
+    pub prev_publish_time: i64,   // Previous update timestamp
+    
+    // Status
+    pub status: PriceStatus,      // Trading, Halted, Unknown
+    pub num_publishers: u32,      // How many sources contributed
+    
+    // Historical (for TWAP, EMA)
+    pub ema_price: i64,           // Exponential moving average
+    pub ema_conf: u64,
+}
+
+pub enum PriceStatus {
+    Trading,  // Normal operation
+    Halted,   // Exchange/feed halted
+    Unknown,  // No recent data
+}
+```
+
+### Reading Price Accounts
+
+Your program deserializes the account data to read prices:
+
+```rust
+pub fn get_price(price_account: &AccountInfo) -> Result<PriceFeed> {
+    // Verify the account is owned by the oracle program
+    require!(
+        price_account.owner == &ORACLE_PROGRAM_ID,
+        ErrorCode::InvalidOracleAccount
+    );
+    
+    // Deserialize
+    let data = price_account.try_borrow_data()?;
+    let price_feed = PriceFeed::try_from_slice(&data)?;
+    
+    Ok(price_feed)
+}
+```
+
+Always verify the account owner. An attacker could pass their own account with fake price data if you don't check.
+
+<ArticleSection name="What's Next" id="whats-next" level="h2" />
+
+Now that you understand how oracles work conceptually, the next lessons dive into the two major oracle networks on Solana:
+
+**[Pyth Network](/courses/oracles-on-solana/pyth-network)**: A specialized price oracle with institutional data publishers. Best for major trading pairs with high-frequency updates.
+
+**[Switchboard](/courses/oracles-on-solana/switchboard)**: A permissionless oracle network where you can create custom data feeds. Best for protocol-controlled oracles and aggregated data.
+
+Each takes a different approach to the problems we've discussed. Understanding both lets you choose the right tool for your protocol.

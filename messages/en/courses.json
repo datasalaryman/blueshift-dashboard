@@ -79,6 +79,28 @@
         "conclusion": "Conclusion"
       }
     },
+    "oracles-on-solana": {
+      "title": "Oracles on Solana",
+      "lessons": {
+        "how-oracles-work": "How Oracles Work",
+        "pyth-network": "Pyth Network",
+        "switchboard": "Switchboard",
+        "advanced-patterns": "Advanced Patterns",
+        "conclusion": "Conclusion"
+      }
+    },
+    "amm-architectures": {
+      "title": "AMM Architectures",
+      "lessons": {
+        "from-orderbooks-to-amms": "From Order Books to AMMs",
+        "stableswap": "StableSwap",
+        "concentrated-liquidity": "Concentrated Liquidity",
+        "weighted-pools": "Weighted Pools",
+        "oracle-integrated-amms": "Oracle-Integrated AMMs",
+        "emerging-designs": "Emerging Designs",
+        "conclusion": "Conclusion"
+      }
+    },
     "secp256r1-on-solana": {
       "title": "Secp256r1 on Solana",
       "lessons": {

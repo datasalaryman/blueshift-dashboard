@@ -1,0 +1,328 @@
+import { ArticleSection } from "../../../../components/ArticleSection/ArticleSection";
+
+# Pyth Network
+
+Pyth is a specialized price oracle built for DeFi. It aggregates price data from institutional market makers and exchanges, the people who actually make markets, and publishes it on-chain with sub-second latency.
+
+<ArticleSection name="Architecture" id="architecture" level="h2" />
+
+### How Data Flows
+
+```
+Market Makers & Exchanges (Publishers)
+            ↓
+    Pyth Network (off-chain aggregation)
+            ↓
+    Pythnet (Pyth's own chain)
+            ↓
+    Wormhole (cross-chain messaging)
+            ↓
+    Solana (price accounts your program reads)
+```
+
+**Publishers** are institutional players: Jane Street, Jump Trading, Binance, and others. They submit prices from their trading systems, the same prices they use for actual trading.
+
+**Pyth Network** aggregates publisher submissions off-chain, calculates the aggregate price and confidence interval, and publishes to Pythnet.
+
+**Pythnet** is Pyth's own appchain (built on Solana's codebase) that stores all price feeds with ~400ms update frequency.
+
+**Wormhole** bridges prices from Pythnet to destination chains including Solana mainnet.
+
+### Why This Architecture?
+
+Publishing every price update for hundreds of feeds directly on Solana mainnet would be prohibitively expensive. By aggregating on Pythnet first, Pyth can support thousands of price feeds efficiently.
+
+The tradeoff: there's an extra step (and trust assumption) in the bridge from Pythnet to Solana.
+
+<ArticleSection name="Pull Model" id="pull-model" level="h2" />
+
+Pyth uses a pull model. Prices exist on Pythnet, but your Solana transaction must explicitly request an update.
+
+### How It Works
+
+1. Before your transaction, fetch the latest price update from Pyth's Hermes service (off-chain API)
+2. Include that update data in your transaction
+3. Your transaction calls Pyth's program to verify and post the update
+4. Now the price account is fresh, and your program can read it
+
+```rust
+// Conceptual flow (simplified)
+pub fn execute_trade(ctx: Context<ExecuteTrade>, pyth_update: Vec<u8>) -> Result<()> {
+    // Step 1: Post the price update (verifies signature, updates account)
+    pyth_solana_receiver::cpi::post_update(
+        ctx.accounts.pyth_context(),
+        pyth_update,
+    )?;
+    
+    // Step 2: Read the now-fresh price
+    let price_feed = ctx.accounts.price_feed.get_price_no_older_than(
+        &Clock::get()?,
+        60, // max age in seconds
+    )?;
+    
+    // Step 3: Use the price
+    let sol_price = price_feed.price;
+    
+    // ... rest of your logic
+    
+    Ok(())
+}
+```
+
+> You can perform the price update on your client side and bundled it up with your smart contract instruction. This way you will only need to check the staleness without CPI.
+
+<ArticleSection name="Price Feed Structure" id="price-structure" level="h2" />
+
+### The Price Object
+
+```rust
+pub struct Price {
+    pub price: i64,          // Price in fixed-point representation
+    pub conf: u64,           // Confidence interval
+    pub expo: i32,           // Exponent (e.g., -8)
+    pub publish_time: i64,   // Unix timestamp
+}
+```
+
+**Price and Exponent**: Pyth uses scaled integers. A price of `10050000000` with exponent `-8` means:
+
+```rust
+// Real price = price * 10^expo
+// 10050000000 * 10^-8 = 100.50
+let real_price = (price as f64) * 10_f64.powi(expo);
+```
+
+In practice, you work in integers to avoid floating-point:
+
+```rust
+// Convert price to your protocol's precision
+const TARGET_PRECISION: u128 = 1_000_000_000; // 10^9
+
+fn normalize_pyth_price(price: i64, expo: i32) -> Result<u64> {
+    let price_u128 = price as u128;
+    
+    if expo >= 0 {
+        // Price needs to be scaled up
+        let multiplier = 10_u128.pow(expo as u32);
+        Ok((price_u128 * multiplier * TARGET_PRECISION) as u64)
+    } else {
+        // Price needs to be scaled down
+        let divisor = 10_u128.pow((-expo) as u32);
+        Ok((price_u128 * TARGET_PRECISION / divisor) as u64)
+    }
+}
+```
+
+### Confidence Intervals
+
+Confidence represents publisher disagreement. If 20 publishers all submit $100.00, confidence is near zero. If half submit $100 and half submit $95, confidence is wide.
+
+```rust
+// Check confidence is acceptable (< 2% of price)
+fn validate_confidence(price: &Price) -> Result<()> {
+    let price_abs = price.price.unsigned_abs();
+    let max_conf = price_abs * 2 / 100; // 2%
+    
+    require!(price.conf <= max_conf, ErrorCode::ConfidenceTooWide);
+    Ok(())
+}
+```
+
+> Always check confidence: for sensitive operations. Wide confidence during volatility is the oracle telling you it's uncertain.
+
+### Price Status
+
+Pyth prices have a status indicating data quality:
+
+```rust
+pub enum PriceStatus {
+    Trading,  // Normal, reliable data
+    Halted,   // Underlying market halted (e.g., stock market closed)
+    Unknown,  // Insufficient data
+}
+```
+
+Most DeFi only accepts `Trading` status:
+
+```rust
+let price = price_feed.get_price_no_older_than(&clock, max_age)?;
+// get_price_no_older_than returns None if status isn't Trading
+```
+
+<ArticleSection name="Integration with Anchor" id="anchor-integration" level="h2" />
+
+### Dependencies
+
+```toml
+# Cargo.toml
+[dependencies]
+pyth-solana-receiver-sdk = "*.*"
+```
+
+### Account Setup
+
+```rust
+use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
+
+#[derive(Accounts)]
+pub struct ExecuteTrade<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    
+    // Pyth price account - verified by the SDK
+    pub price_update: Account<'info, PriceUpdateV2>,
+    
+    // Your other accounts...
+}
+```
+
+### Reading Prices
+
+```rust
+use pyth_solana_receiver_sdk::price_update::{get_feed_id_from_hex, PriceUpdateV2};
+
+// SOL/USD feed ID (from Pyth's price feed registry)
+const SOL_USD_FEED_ID: &str = "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
+
+pub fn get_sol_price(ctx: Context<GetPrice>) -> Result<i64> {
+    let price_update = &ctx.accounts.price_update;
+    let clock = Clock::get()?;
+    
+    let feed_id = get_feed_id_from_hex(SOL_USD_FEED_ID)?;
+    
+    let price = price_update.get_price_no_older_than(
+        &clock,
+        60, // Maximum age: 60 seconds
+        &feed_id,
+    )?;
+    
+    // Validate confidence
+    require!(
+        price.conf < (price.price.unsigned_abs() / 50), // < 2%
+        ErrorCode::PriceConfidenceTooWide
+    );
+    
+    Ok(price.price)
+}
+```
+
+### Posting Updates
+
+To get fresh prices, your client must fetch update data from Hermes and include it in the transaction:
+
+```typescript
+// Client-side (TypeScript)
+import { PriceServiceConnection } from "@pythnetwork/price-service-client";
+
+const connection = new PriceServiceConnection("https://hermes.pyth.network");
+
+// Fetch latest price update
+const priceIds = ["0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d"]; // SOL/USD
+const priceUpdates = await connection.getLatestVaas(priceIds);
+
+// Include in your transaction
+const tx = await program.methods
+    .executeTrade(priceUpdates[0])
+    .accounts({
+        priceUpdate: pythPriceAccount,
+        // ... other accounts
+    })
+    .rpc();
+```
+
+<ArticleSection name="Available Price Feeds" id="price-feeds" level="h2" />
+
+Pyth supports hundreds of price feeds across:
+
+- **Crypto**: SOL/USD, BTC/USD, ETH/USD, and most major tokens
+- **FX**: EUR/USD, GBP/USD, etc.
+- **Equities**: AAPL, TSLA, etc. (when markets are open)
+- **Commodities**: Gold, oil, etc.
+
+Find feed IDs at [insights.pyth.network/price-feeds](https://insights.pyth.network/price-feeds).
+
+### Feed ID Best Practices
+
+```rust
+// Store feed IDs in your config account
+#[account]
+pub struct Config {
+    pub feed_id: [u8; 32],   // e.g., SOL/USD
+    // ... other config
+}
+```
+
+Don't hardcode feed IDs as strings in your program. Store them in accounts so they can be updated if Pyth changes feed IDs.
+
+<ArticleSection name="Common Patterns" id="patterns" level="h2" />
+
+### Helper Method Pattern
+
+A clean production pattern: store the feed_id in your config account and add a helper method to your instruction context:
+
+```rust
+use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
+
+const MAXIMUM_AGE: u64 = 60; // seconds
+
+#[derive(Accounts)]
+pub struct ExecuteTrade<'info> {
+    #[account(has_one = price_update)]
+    pub config: Account<'info, Config>,
+    pub price_update: Account<'info, PriceUpdateV2>,
+    // ...
+}
+
+impl<'info> ExecuteTrade<'info> {
+    #[inline(always)]
+    fn get_price(&self, clock: &Clock) -> Result<(u64, u8)> {
+        let price_data = self.price_update.get_price_no_older_than(
+            clock,
+            MAXIMUM_AGE,
+            &self.config.feed_id,
+        )?;
+
+        let price = u64::try_from(price_data.price)
+            .map_err(|_| ErrorCode::InvalidPrice)?;
+
+        require_gt!(price, 0, ErrorCode::InvalidPrice);
+
+        let exponent = u8::try_from(price_data.exponent.abs())
+            .map_err(|_| ErrorCode::InvalidPrice)?;
+
+        Ok((price, exponent))
+    }
+}
+
+pub fn execute_trade(ctx: Context<ExecuteTrade>) -> Result<()> {
+    let clock = Clock::get()?;
+    let (price, exponent) = ctx.accounts.get_price(&clock)?;
+    
+    // Use price and exponent...
+    Ok(())
+}
+```
+
+This pattern:
+- Validates the correct price feed is passed via `has_one = price_update`
+- Centralizes staleness checks and price validation
+- Returns clean `(u64, u8)` for easy arithmetic
+- Rejects negative prices (which shouldn't happen but safety first)
+
+### Conservative Pricing
+
+For collateral, use the lower bound. For debt, use the upper bound:
+
+```rust
+pub fn get_conservative_collateral_price(price: &Price) -> i64 {
+    // Use price - confidence for collateral (pessimistic)
+    price.price.saturating_sub(price.conf as i64)
+}
+
+pub fn get_conservative_debt_price(price: &Price) -> i64 {
+    // Use price + confidence for debt (pessimistic)
+    price.price.saturating_add(price.conf as i64)
+}
+```
+
+Next lesson: [Switchboard](/courses/oracles-on-solana/switchboard) - for custom feeds and protocol-controlled oracles.

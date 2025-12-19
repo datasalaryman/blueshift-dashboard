@@ -1,0 +1,320 @@
+import { ArticleSection } from "../../../../components/ArticleSection/ArticleSection";
+
+# Advanced Oracle Patterns
+
+You know how to read prices from Pyth and Switchboard. Now let's cover the advanced patterns that production protocols use: multi-oracle strategies, TWAP for manipulation resistance, EMA for smoothing, and sophisticated circuit breakers.
+
+These patterns are the difference between a protocol that survives market chaos and one that gets exploited.
+
+<ArticleSection name="Why Use Multiple Oracles" id="multi-oracle" level="h2" />
+
+### Single Point of Failure
+
+Oracle failures happen. Pyth has had outages. Switchboard oracles have submitted bad data. Relying on a single oracle is like having a single database with no backups.
+
+Using multiple oracles provides:
+
+1. **Availability**: If one fails, fall back to the other
+2. **Validation**: Compare prices to detect manipulation
+3. **Confidence**: Agreement between independent sources increases trust
+
+### Primary/Backup Pattern
+
+Try Pyth first, fall back to Switchboard:
+
+```rust
+pub fn get_price_with_fallback(
+    pyth_account: &AccountInfo,
+    switchboard_account: &AccountInfo,
+    feed_id: &[u8; 32],
+    max_staleness: i64,
+) -> Result<ValidatedPrice> {
+    let clock = Clock::get()?;
+    
+    // Try Pyth first
+    if let Ok(pyth_price) = get_pyth_price(pyth_account, feed_id, max_staleness, &clock) {
+        return Ok(ValidatedPrice {
+            price: pyth_price.price,
+            confidence: pyth_price.conf,
+            source: PriceSource::Pyth,
+            timestamp: pyth_price.publish_time,
+        });
+    }
+    
+    // Fall back to Switchboard
+    if let Ok(sb_price) = get_switchboard_price(switchboard_account, max_staleness, &clock) {
+        return Ok(ValidatedPrice {
+            price: sb_price.mantissa,
+            confidence: estimate_confidence(&sb_price),
+            source: PriceSource::Switchboard,
+            timestamp: sb_price.timestamp,
+        });
+    }
+    
+    // Both failed
+    err!(ErrorCode::NoValidPriceAvailable)
+}
+```
+
+### Cross-Validation Pattern
+
+For critical operations (liquidations, large trades), require both oracles to agree:
+
+```rust
+const MAX_DEVIATION_BPS: u64 = 100; // 1% max difference
+
+pub fn get_validated_price(
+    pyth_account: &AccountInfo,
+    switchboard_account: &AccountInfo,
+    feed_id: &[u8; 32],
+) -> Result<u64> {
+    let clock = Clock::get()?;
+    
+    let pyth_price = get_pyth_price(pyth_account, feed_id, 60, &clock)?;
+    let sb_price = get_switchboard_price(switchboard_account, 60, &clock)?;
+    
+    // Normalize to same precision
+    let pyth_normalized = normalize_pyth_price(pyth_price)?;
+    let sb_normalized = normalize_switchboard_price(sb_price)?;
+    
+    // Check they agree within tolerance
+    let deviation = calculate_deviation(pyth_normalized, sb_normalized);
+    require!(deviation <= MAX_DEVIATION_BPS, ErrorCode::OraclePriceMismatch);
+    
+    // Use the more conservative price
+    Ok(std::cmp::min(pyth_normalized, sb_normalized))
+}
+
+fn calculate_deviation(price_a: u64, price_b: u64) -> u64 {
+    let diff = if price_a > price_b {
+        price_a - price_b
+    } else {
+        price_b - price_a
+    };
+    
+    let avg = (price_a + price_b) / 2;
+    (diff * 10_000) / avg
+}
+```
+
+If the oracles disagree by more than 1%, something is wrong; either manipulation, a bug, or market chaos. Better to pause than execute at a wrong price.
+
+### Weighted Aggregation
+
+Combine prices with weights based on freshness:
+
+```rust
+pub fn get_weighted_price(
+    pyth_price: &PythPrice,
+    switchboard_price: &SwitchboardPrice,
+) -> Result<u64> {
+    let clock = Clock::get()?;
+    
+    // Fresher prices get higher weight
+    let pyth_age = clock.unix_timestamp - pyth_price.publish_time;
+    let sb_age = clock.unix_timestamp - switchboard_price.timestamp;
+    
+    let pyth_weight = 100 - std::cmp::min(pyth_age, 100) as u64;
+    let sb_weight = 100 - std::cmp::min(sb_age, 100) as u64;
+    let total_weight = pyth_weight + sb_weight;
+    
+    if total_weight == 0 {
+        return err!(ErrorCode::BothPricesTooStale);
+    }
+    
+    let pyth_normalized = normalize_pyth_price(pyth_price)?;
+    let sb_normalized = normalize_switchboard_price(switchboard_price)?;
+    
+    let weighted = (pyth_normalized as u128 * pyth_weight as u128
+        + sb_normalized as u128 * sb_weight as u128)
+        / total_weight as u128;
+    
+    Ok(weighted as u64)
+}
+```
+
+<ArticleSection name="Time-Weighted Average Price (TWAP)" id="twap" level="h2" />
+
+### Why TWAP?
+
+Spot prices can be manipulated in a single block. Flash loan $100M, spike the price, exploit a protocol, return the loan. All in one transaction.
+
+TWAP averages prices over time. To manipulate a 30-minute TWAP, an attacker would need to sustain the manipulation for 30 minutes; far more expensive and risky.
+
+### Implementing On-Chain TWAP
+
+Store price observations and calculate the average:
+
+```rust
+#[account]
+pub struct TwapOracle {
+    pub observations: [PriceObservation; 30],  // Last 30 observations
+    pub observation_index: u8,                  // Current write position
+    pub observation_count: u8,                  // Total observations stored
+    pub last_observation_time: i64,
+    pub min_observation_interval: i64,          // Minimum time between observations
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default)]
+pub struct PriceObservation {
+    pub price: u64,
+    pub timestamp: i64,
+}
+
+impl TwapOracle {
+    pub fn record_observation(&mut self, price: u64, timestamp: i64) -> Result<()> {
+        // Enforce minimum interval
+        let elapsed = timestamp - self.last_observation_time;
+        require!(elapsed >= self.min_observation_interval, ErrorCode::ObservationTooSoon);
+        
+        // Write observation
+        self.observations[self.observation_index as usize] = PriceObservation { price, timestamp };
+        
+        // Update index (circular buffer)
+        self.observation_index = (self.observation_index + 1) % 30;
+        if self.observation_count < 30 {
+            self.observation_count += 1;
+        }
+        
+        self.last_observation_time = timestamp;
+        Ok(())
+    }
+    
+    pub fn get_twap(&self, window_seconds: i64) -> Result<u64> {
+        let current_time = Clock::get()?.unix_timestamp;
+        let window_start = current_time - window_seconds;
+        
+        let mut weighted_sum: u128 = 0;
+        let mut total_time: i64 = 0;
+        
+        // Iterate through observations in time order
+        let mut prev_obs: Option<PriceObservation> = None;
+        
+        for i in 0..self.observation_count {
+            let idx = (self.observation_index as i32 - 1 - i as i32)
+                .rem_euclid(30) as usize;
+            let obs = self.observations[idx];
+            
+            if obs.timestamp < window_start {
+                break; // Outside window
+            }
+            
+            if let Some(prev) = prev_obs {
+                let duration = prev.timestamp - obs.timestamp;
+                weighted_sum += obs.price as u128 * duration as u128;
+                total_time += duration;
+            }
+            
+            prev_obs = Some(obs);
+        }
+        
+        require!(total_time > 0, ErrorCode::InsufficientTwapData);
+        
+        Ok((weighted_sum / total_time as u128) as u64)
+    }
+}
+```
+
+### Using TWAP with External Oracles
+
+Many protocols store observations from Pyth/Switchboard to build their own TWAP:
+
+```rust
+pub fn update_twap_from_oracle(
+    ctx: Context<UpdateTwap>,
+) -> Result<()> {
+    let oracle_price = get_validated_price(&ctx.accounts.pyth_account)?;
+    let clock = Clock::get()?;
+    
+    ctx.accounts.twap_oracle.record_observation(
+        oracle_price,
+        clock.unix_timestamp,
+    )?;
+    
+    Ok(())
+}
+
+pub fn get_manipulation_resistant_price(
+    ctx: Context<GetPrice>,
+    use_twap: bool,
+) -> Result<u64> {
+    if use_twap {
+        // Use 30-minute TWAP for sensitive operations
+        ctx.accounts.twap_oracle.get_twap(1800)
+    } else {
+        // Use spot for less sensitive operations
+        get_validated_price(&ctx.accounts.pyth_account)
+    }
+}
+```
+
+<ArticleSection name="Exponential Moving Average (EMA)" id="ema" level="h2" />
+
+### EMA vs TWAP
+
+TWAP weights all prices in the window equally. EMA gives more weight to recent prices while still smoothing out spikes.
+
+```
+TWAP: [100, 100, 100, 150, 100] → 110 (simple average)
+EMA:  [100, 100, 100, 150, 100] → ~105 (recent prices weighted less due to spike)
+```
+
+### On-Chain EMA
+
+```rust
+#[account]
+pub struct EmaOracle {
+    pub ema_price: u64,
+    pub last_price: u64,
+    pub last_update: i64,
+    pub smoothing_factor: u64,  // Alpha * PRECISION (e.g., 0.1 * 10^9)
+}
+
+const PRECISION: u64 = 1_000_000_000;
+
+impl EmaOracle {
+    pub fn update(&mut self, new_price: u64, current_time: i64) -> Result<()> {
+        if self.ema_price == 0 {
+            // First observation
+            self.ema_price = new_price;
+        } else {
+            // EMA = alpha * new_price + (1 - alpha) * old_EMA
+            let alpha = self.smoothing_factor;
+            let one_minus_alpha = PRECISION - alpha;
+            
+            self.ema_price = ((new_price as u128 * alpha as u128
+                + self.ema_price as u128 * one_minus_alpha as u128)
+                / PRECISION as u128) as u64;
+        }
+        
+        self.last_price = new_price;
+        self.last_update = current_time;
+        
+        Ok(())
+    }
+}
+```
+
+### Pyth's Built-in EMA
+
+Pyth provides EMA prices directly:
+
+```rust
+use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
+
+pub fn get_pyth_ema(price_update: &PriceUpdateV2, feed_id: &[u8; 32]) -> Result<i64> {
+    let clock = Clock::get()?;
+    
+    let ema_price = price_update.get_ema_price_no_older_than(
+        &clock,
+        300, // max 5 min staleness
+        feed_id,
+    )?;
+    
+    Ok(ema_price.price)
+}
+```
+
+Use Pyth's EMA when available, it's calculated from more data than you'd have on-chain.
+
+Next: [Conclusion](/courses/oracles-on-solana/conclusion) - key takeaways and the oracle mindset.

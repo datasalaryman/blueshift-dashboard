@@ -1,0 +1,505 @@
+import { ArticleSection } from "../../../../components/ArticleSection/ArticleSection";
+
+# Switchboard
+
+Switchboard takes a different approach from Pyth. While Pyth publishes price data to accounts you read from, Switchboard uses **instruction introspection**. The oracle signs data off-chain, you pass it as an Ed25519 instruction, and your program verifies and writes it to your own account.
+
+This gives you full control over your oracle data.
+
+<ArticleSection name="How It Works" id="how-it-works" level="h2" />
+
+### The Switchboard On-Demand Flow
+
+```
+1. Client fetches oracle quote from Crossbar API
+              ↓
+2. Oracle signs the data with Ed25519
+              ↓
+3. Client includes Ed25519 instruction in transaction
+              ↓
+4. Your program verifies signature via instruction introspection
+              ↓
+5. Data is written to your PDA account
+              ↓
+6. Your program reads from your own account
+```
+
+The key insight: **you own the oracle account**. It's a PDA derived from your program. Anyone can update it (permissionless), but the data is always verified against the oracle's signature.
+
+### Why This Architecture?
+
+**Efficiency**: Writing directly to your PDA is cheaper than reading from external accounts.
+
+**Control**: You decide when updates happen. No waiting for cranks or network updates.
+
+**Permissionless**: Anyone can trigger an update. If your feed ID is in your config, users can refresh the price themselves.
+
+**Verification**: Instruction introspection ensures the data came from a legitimate oracle, signed by the Switchboard queue.
+
+<ArticleSection name="Integration with Anchor" id="anchor-integration" level="h2" />
+
+### Dependencies
+
+```toml
+# Cargo.toml
+[dependencies]
+switchboard-on-demand = "*.*"
+```
+
+### Generate Types
+
+At your program's root module, generate the Switchboard types:
+
+```rust
+// lib.rs
+use anchor_lang::prelude::*;
+
+// Generate Switchboard types at the root module level
+switchboard_anchor_bindings!();
+
+declare_id!("YOUR_PROGRAM_ID");
+
+#[program]
+pub mod your_program {
+    // ...
+}
+```
+
+### The Update Oracle Instruction
+
+```rust
+use anchor_lang::prelude::*;
+use anchor_lang::solana_program::sysvar::instructions::ID as SYSVAR_INSTRUCTIONS_PUBKEY;
+use switchboard_on_demand::OracleQuote;
+
+#[derive(Accounts)]
+pub struct UpdateOracle<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    
+    #[account(
+        seeds = [b"config"],
+        bump = config.bump,
+    )]
+    pub config: Account<'info, Config>,
+    
+    /// CHECK: Validated by Switchboard
+    pub queue_account: UncheckedAccount<'info>,
+    
+    #[account(
+        mut,
+        seeds = [b"oracle", config.key().as_ref()],
+        bump
+    )]
+    /// CHECK: Oracle account is our PDA, will be written to
+    pub oracle_account: UncheckedAccount<'info>,
+    
+    /// CHECK: Sysvar for instruction introspection
+    #[account(address = SYSVAR_INSTRUCTIONS_PUBKEY)]
+    pub sysvar_instructions: UncheckedAccount<'info>,
+}
+
+impl<'info> UpdateOracle<'info> {
+    pub fn update_oracle(&mut self) -> Result<()> {
+        // Write oracle data from the Ed25519 instruction to our PDA
+        OracleQuote::write_from_ix_unchecked(
+            self.sysvar_instructions.to_account_info(),
+            self.oracle_account.to_account_info(),
+            &self.queue_account.key().to_bytes(),
+            0, // instruction index
+        );
+    
+        Ok(())
+    }        
+}
+```
+
+Key points:
+- `oracle_account` is YOUR PDA, not a Switchboard account
+- `sysvar_instructions` enables reading the Ed25519 instruction
+- `write_from_ix_unchecked` verifies the signature and writes data to your account
+- The queue's pubkey ensures data came from legitimate Switchboard oracles
+
+### Reading Oracle Data
+
+Once updated, read from your oracle account:
+
+```rust
+use switchboard_on_demand::OracleQuote;
+
+impl<'info> YourInstruction<'info> {
+    pub fn execute(&mut self) -> Result<()> {
+        // Access the feeds from your oracle account
+        let feeds = self.oracle_account.feeds();
+        
+        // Get price from a specific feed
+        let price = feeds[0].feed_value();
+        
+        // Check staleness (slots, not seconds)
+        self.check_staleness()?;
+        
+        // Use the price...
+        Ok(())
+    }
+    
+    fn check_staleness(&self) -> Result<()> {
+        let oracle_data = self.oracle_account.data;
+        
+        // Parse the slot from oracle data
+        // Data format: 2-byte length prefix, then instruction data with slot at end
+        if oracle_data.len() < 2 {
+            return Err(ErrorCode::InvalidOracleData.into());
+        }
+        
+        let data_len = u16::from_le_bytes([oracle_data[0], oracle_data[1]]) as usize;
+        
+        if oracle_data.len() < data_len + 2 || data_len < 13 {
+            return Err(ErrorCode::InvalidOracleData.into());
+        }
+        
+        // Slot is stored 13 bytes from the end of instruction data
+        let slot_offset = data_len - 13 + 2; // +2 for length prefix
+        let oracle_slot = u64::from_le_bytes(
+            oracle_data[slot_offset..slot_offset + 8].try_into().unwrap()
+        );
+        
+        // Check staleness (20 slots ≈ 10 seconds)
+        let current_slot = Clock::get()?.slot;
+        let slot_difference = current_slot.saturating_sub(oracle_slot);
+        
+        require!(slot_difference <= 20, ErrorCode::StaleOracle);
+        
+        Ok(())
+    }
+}
+```
+
+<ArticleSection name="Client-Side Integration" id="client-side" level="h2" />
+
+### Fetching Oracle Data
+
+The client fetches the signed oracle data from Switchboard's Crossbar service:
+
+```typescript
+import * as sb from "@switchboard-xyz/on-demand";
+import { Connection, TransactionInstruction } from "@solana/web3.js";
+import { CrossbarClient } from "@switchboard-xyz/common";
+
+export const createEd25519Instructions = async (
+    connection: Connection, 
+    feedIds: string[]
+): Promise<TransactionInstruction> => {
+    // Load Switchboard program
+    const sbProgram = await sb.AnchorUtils.loadProgramFromConnection(
+        connection,
+        null,
+        sb.ON_DEMAND_MAINNET_PID
+    );
+
+    // Load the default queue
+    const queue = await sb.Queue.loadDefault(sbProgram);
+    
+    // Connect to Crossbar (Switchboard's off-chain service)
+    const crossbar = new CrossbarClient("https://crossbar.switchboard.xyz");
+    
+    // Fetch the Ed25519 instruction with signed oracle data
+    const ed25519Instruction = await queue.fetchQuoteIx(
+        crossbar,
+        feedIds,
+        {
+            numSignatures: 1,
+            variableOverrides: {},
+            instructionIdx: 0,
+        }
+    );
+
+    return ed25519Instruction;
+};
+```
+
+### Production-Ready Client with Retry Logic
+
+Oracle fetches can fail. Always use retry logic:
+
+```typescript
+async function retryWithBackoff<T>(
+    fn: () => Promise<T>,
+    maxRetryDurationMs: number = 30000,
+    initialDelayMs: number = 500
+): Promise<T> {
+    const startTime = Date.now();
+    let delay = initialDelayMs;
+    let lastError: Error | null = null;
+
+    while (Date.now() - startTime < maxRetryDurationMs) {
+        try {
+            return await fn();
+        } catch (error) {
+            lastError = error as Error;
+            const elapsed = Date.now() - startTime;
+            
+            console.warn(
+                `Oracle fetch attempt failed (${elapsed}ms elapsed): ${lastError.message}`
+            );
+            
+            if (elapsed + delay >= maxRetryDurationMs) {
+                break;
+            }
+            
+            await new Promise(resolve => setTimeout(resolve, delay));
+            delay = Math.min(delay * 2, 5000); // Cap at 5 seconds
+        }
+    }
+
+    throw new Error(
+        `Failed to fetch oracle data after ${maxRetryDurationMs}ms. ` +
+        `Last error: ${lastError?.message}`
+    );
+}
+
+// Usage
+const ed25519Instruction = await retryWithBackoff(
+    () => queue.fetchQuoteIx(crossbar, feedIds, options),
+    30000, // 30 seconds max
+    500    // 500ms initial delay
+);
+```
+
+### Building the Transaction
+
+Include the Ed25519 instruction before your program instruction:
+
+```typescript
+import { Transaction } from "@solana/web3.js";
+
+async function updateOracleAndExecute(
+    connection: Connection,
+    program: Program,
+    feedIds: string[]
+) {
+    // 1. Get the Ed25519 instruction with oracle data
+    const ed25519Ix = await createEd25519Instructions(connection, feedIds);
+    
+    // 2. Create your update oracle instruction
+    const updateOracleIx = await program.methods
+        .updateOracle()
+        .accounts({
+            payer: wallet.publicKey,
+            config: configPda,
+            queueAccount: queue.pubkey,
+            oracleAccount: oraclePda,
+            sysvarInstructions: SYSVAR_INSTRUCTIONS_PUBKEY,
+        })
+        .instruction();
+    
+    // 3. Create your actual operation instruction
+    const executeIx = await program.methods
+        .execute()
+        .accounts({
+            // ...
+        })
+        .instruction();
+    
+    // 4. Bundle them together
+    const tx = new Transaction()
+        .add(ed25519Ix)      // Ed25519 signature verification
+        .add(updateOracleIx) // Write oracle data to your PDA
+        .add(executeIx);     // Your actual operation
+    
+    return await sendAndConfirmTransaction(connection, tx, [wallet]);
+}
+```
+
+<ArticleSection name="Permissionless Updates" id="permissionless" level="h2" />
+
+### Why Permissionless Matters
+
+If your oracle PDA is derived deterministically and the feed ID is stored in your config, **anyone can update the oracle**. This is powerful:
+
+- Users don't need special permissions
+- Keepers can update on your behalf
+- No bottleneck on who triggers updates
+
+```rust
+#[account]
+pub struct Config {
+    pub bump: u8,
+    pub feed_id: [u8; 32],  // Stored feed ID
+    // ...
+}
+
+#[derive(Accounts)]
+pub struct UpdateOracle<'info> {
+    // Anyone can pay
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    
+    // Config stores the expected feed ID
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    
+    // Oracle PDA derived from config
+    #[account(mut, seeds = [b"oracle", config.key().as_ref()], bump)]
+    /// CHECK: Our PDA
+    pub oracle_account: UncheckedAccount<'info>,
+    
+    // ...
+}
+```
+
+### Safety Through Verification
+
+Permissionless doesn't mean unsafe. The oracle data is verified because:
+
+1. **Ed25519 signature check**: Data must be signed by a Switchboard oracle
+2. **Queue verification**: The queue pubkey is validated
+3. **Feed ID matching**: Your program can verify the feed ID matches config
+4. **Staleness checks**: Old data is rejected
+
+```rust
+impl<'info> UpdateOracle<'info> {
+    pub fn update_oracle(&mut self) -> Result<()> {
+        // Write and verify in one step
+        OracleQuote::write_from_ix_unchecked(
+            self.sysvar_instructions.to_account_info(),
+            self.oracle_account.to_account_info(),
+            &self.queue_account.key().to_bytes(),
+            0,
+        );
+        
+        // Additional verification: check feed matches config
+        let feeds = self.oracle_account.feeds();
+        require!(!feeds.is_empty(), ErrorCode::NoFeeds);
+        
+        // The write already verified the signature and queue
+        // Your program owns the oracle account
+        
+        Ok(())
+    }
+}
+```
+
+<ArticleSection name="Multiple Feeds" id="multiple-feeds" level="h2" />
+
+### Fetching Multiple Prices
+
+Request multiple feed IDs in one call:
+
+```typescript
+const feedIds = [
+    "SOL_USD_FEED_ID",
+    "BTC_USD_FEED_ID", 
+    "ETH_USD_FEED_ID"
+];
+
+const ed25519Ix = await queue.fetchQuoteIx(crossbar, feedIds, {
+    numSignatures: 1,
+    variableOverrides: {},
+    instructionIdx: 0,
+});
+```
+
+### Reading Multiple Feeds
+
+```rust
+pub fn calculate_portfolio_value(&self) -> Result<u128> {
+    let feeds = self.oracle_account.feeds();
+    
+    // feeds[0] = SOL/USD
+    // feeds[1] = BTC/USD
+    // feeds[2] = ETH/USD
+    
+    let sol_value = self.sol_balance as u128 * feeds[0].feed_value() as u128;
+    let btc_value = self.btc_balance as u128 * feeds[1].feed_value() as u128;
+    let eth_value = self.eth_balance as u128 * feeds[2].feed_value() as u128;
+    
+    Ok(sol_value + btc_value + eth_value)
+}
+```
+
+<ArticleSection name="Switchboard vs Pyth" id="comparison" level="h2" />
+
+| Aspect | Switchboard On-Demand | Pyth |
+|--------|----------------------|------|
+| **Data Flow** | Ed25519 instruction → your PDA | Read from Pyth accounts |
+| **Account Ownership** | You own the oracle account | Pyth owns price accounts |
+| **Update Trigger** | Client fetches and includes | Client fetches and posts |
+| **Staleness Unit** | Slots (~400ms each) | Seconds |
+| **Verification** | Instruction introspection | Account validation |
+| **Permissionless** | Anyone can update your PDA | Anyone can post updates |
+
+### When to Use Each
+
+**Switchboard** when:
+- You want to own your oracle data
+- You need custom feeds or data sources
+- You prefer slot-based staleness (more precise)
+- You want instruction introspection patterns
+
+**Pyth** when:
+- You need major trading pairs with institutional data
+- You want simpler integration (read from account)
+- You prefer the confidence interval model
+- You need sub-second price updates
+
+<ArticleSection name="Best Practices" id="best-practices" level="h2" />
+
+### 1. Always Check Staleness
+
+Slots, not seconds. 20 slots ≈ 10 seconds on Solana:
+
+```rust
+const MAX_STALENESS_SLOTS: u64 = 20;
+
+fn validate_freshness(oracle_slot: u64) -> Result<()> {
+    let current_slot = Clock::get()?.slot;
+    let age = current_slot.saturating_sub(oracle_slot);
+    require!(age <= MAX_STALENESS_SLOTS, ErrorCode::StaleOracle);
+    Ok(())
+}
+```
+
+### 2. Client-Side Retry Logic
+
+Oracle fetches fail. Always retry:
+
+```typescript
+// Bad: no retry
+const ix = await queue.fetchQuoteIx(crossbar, feedIds, options);
+
+// Good: retry with backoff
+const ix = await retryWithBackoff(
+    () => queue.fetchQuoteIx(crossbar, feedIds, options),
+    30000,
+    500
+);
+```
+
+### 3. Validate Feed Count
+
+Ensure you got all the feeds you requested:
+
+```rust
+pub fn validate_feeds(&self, expected_count: usize) -> Result<()> {
+    let feeds = self.oracle_account.feeds();
+    require_eq!(feeds.len(), expected_count, ErrorCode::InvalidOracleFeeds);
+    Ok(())
+}
+```
+
+### 4. Handle Missing Data Gracefully
+
+```rust
+pub fn get_price_safe(&self, index: usize) -> Result<u64> {
+    let feeds = self.oracle_account.feeds();
+    
+    require!(index < feeds.len(), ErrorCode::FeedIndexOutOfBounds);
+    
+    let price = feeds[index].feed_value();
+    require!(price > 0, ErrorCode::InvalidPrice);
+    
+    Ok(price as u64)
+}
+```
+
+Next: [Advanced Oracle Patterns](/courses/oracles-on-solana/advanced-patterns) - multi-oracle strategies, TWAP, circuit breakers, and handling edge cases.

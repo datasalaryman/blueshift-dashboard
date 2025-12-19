@@ -1,0 +1,247 @@
+import { ArticleSection } from "../../../../components/ArticleSection/ArticleSection";
+
+# From Order Books to AMMs
+
+Every trade needs two parties: a buyer and a seller. For centuries, markets solved this with order books, lists of buy and sell orders waiting to be matched. The New York Stock Exchange, NASDAQ, Binance, they all run on order books.
+
+Then blockchain changed everything. Order books don't work on-chain. The solution that emerged, Automated Market Makers, fundamentally reimagined how trading works.
+
+<ArticleSection name="The Order Book Model" id="order-book" level="h2" />
+
+### How Order Books Work
+
+An order book is a list of outstanding buy orders (bids) and sell orders (asks):
+
+```
+ASKS (Sell Orders)
+$102.50  |  500 shares
+$102.00  |  1,200 shares
+$101.50  |  800 shares
+--------------------------
+$101.00  |  600 shares   ← Best bid
+$100.50  |  2,000 shares
+$100.00  |  1,500 shares
+BIDS (Buy Orders)
+```
+
+The **spread** is the gap between best bid ($101.00) and best ask ($101.50). Market makers profit by buying at the bid and selling at the ask, providing liquidity and earning the spread.
+
+### Why Order Books Dominate Traditional Finance
+
+Order books are efficient:
+- **Price discovery**: Prices emerge from actual supply and demand
+- **Capital efficiency**: Makers only commit capital at specific prices
+- **Precise execution**: Traders control exactly what price they get
+- **Low slippage**: Deep books absorb large orders with minimal price impact
+
+Every major exchange uses order books. They've been refined over decades. They work.
+
+<ArticleSection name="Why Order Books Fail On-Chain" id="onchain-problem" level="h2" />
+
+### The Latency Problem
+
+Order books require speed. A market maker sees a price change, they need to update thousands of orders instantly. On Ethereum mainnet circa 2017:
+- Block time: ~15 seconds
+- Transaction cost: $0.50-50+ during congestion
+- Finality: minutes
+
+You can't run a competitive order book when updating a single order costs dollars and takes seconds. By the time your order is confirmed, the market has moved.
+
+### The State Problem
+
+Order books have massive state. A liquid market might have:
+- Thousands of price levels
+- Tens of thousands of active orders
+- Constant updates (adds, cancels, modifications)
+
+Storing and updating this state on-chain is prohibitively expensive. Each order modification is a transaction. Each transaction costs gas.
+
+### The MEV Problem
+
+On-chain transactions are public before execution. Everyone can see your order in the mempool. This creates toxic dynamics:
+- **Front-running**: Bots see your large buy, buy first, sell to you higher
+- **Sandwich attacks**: Buy before you, sell after you, profit from your slippage
+- **Order sniping**: Cancel your orders before they execute profitably
+
+Traditional market makers have private order flow. On-chain, everything is visible.
+
+### The Result
+
+Early attempts at on-chain order books (EtherDelta, IDEX) were slow, expensive, and illiquid. The UX was terrible. DeFi needed a different model.
+
+<ArticleSection name="The AMM Breakthrough" id="amm-breakthrough" level="h2" />
+
+### Bancor: The First On-Chain AMM (2017)
+
+Bancor launched in June 2017 with a radical idea: what if the smart contract itself was the market maker?
+
+Instead of matching buyers and sellers, Bancor held reserves of tokens and used a formula to calculate prices. No order book. No waiting for counterparties. Trade instantly against the contract.
+
+Bancor introduced:
+- **Bonding curves**: Mathematical functions that determine price based on supply
+- **Continuous liquidity**: Always available, no need to wait for a match
+- **Permissionless listing**: Any token could be traded without exchange approval
+
+But Bancor had problems. The protocol was complex, required their native BNT token as an intermediary, and had centralized upgrade mechanisms.
+
+### Uniswap V1: Simplicity Wins (November 2018)
+
+Hayden Adams, a mechanical engineer who learned Solidity after being laid off, built Uniswap V1 in a few months. It launched with around 500 lines of code.
+
+The insight was brutal simplicity: **x * y = k**
+
+```
+Token A reserve: x
+Token B reserve: y
+Constant: k = x * y
+
+Price of A in terms of B = y / x
+```
+
+That's it. No governance tokens. No complex bonding curves. No intermediary assets. Just two tokens and a constant product formula.
+
+### Why Constant Product Works
+
+The formula `x * y = k` creates elegant properties:
+
+**1. Infinite liquidity** (theoretically): The curve never touches the axes. You can always trade, though prices become extreme.
+
+**2. Self-adjusting prices**: As one token is bought, its price increases automatically. Supply and demand encoded in math.
+
+**3. Arbitrage-driven accuracy**: If Uniswap price diverges from market price, arbitrageurs profit by correcting it. The pool stays in sync with external markets.
+
+**4. Passive liquidity provision**: LPs deposit tokens and earn fees without active management. Set and forget.
+
+<ArticleSection name="The DeFi Summer Explosion" id="defi-summer" level="h2" />
+
+### Uniswap V2 (May 2020)
+
+V2 added critical features:
+- **ERC-20 pairs**: Trade any token against any token (not just ETH)
+- **Price oracles**: Time-weighted average prices (TWAP) for other protocols
+- **Flash swaps**: Borrow tokens, use them, repay in one transaction
+- **Protocol fee switch**: Optional 0.05% fee for protocol development
+
+### The Liquidity Mining Catalyst
+
+In June 2020, Compound launched COMP token distribution to users. Suddenly, using DeFi protocols paid you. Yields went parabolic. Users rushed in.
+
+Uniswap, Sushiswap, Curve, Balancer, all launched tokens and liquidity mining programs. Total Value Locked (TVL) went from $1B to $15B in months.
+
+### The Fork Wars
+
+Uniswap's code was open source. Sushiswap forked it in August 2020, added a token, and tried to vampire attack Uniswap's liquidity. It worked, temporarily.
+
+This kicked off an era of rapid innovation. Every week brought new AMM designs, each trying to solve problems with the constant product formula:
+- **Slippage**: Large trades move price significantly
+- **Impermanent loss**: LPs lose value when prices diverge
+- **Capital inefficiency**: Most liquidity sits unused at extreme prices
+
+<ArticleSection name="The Limitations That Spawned Innovation" id="limitations" level="h2" />
+
+### Slippage
+
+In constant product AMMs, large trades move price significantly:
+
+```
+Pool: 100 ETH, 100,000 USDC (k = 10,000,000)
+Price: 1 ETH = 1,000 USDC
+
+Buy 10 ETH:
+- New ETH reserve: 90
+- New USDC reserve: 10,000,000 / 90 = 111,111
+- Cost: 11,111 USDC for 10 ETH
+- Effective price: 1,111 USDC/ETH (11% slippage!)
+```
+
+For stablecoins that should trade 1:1, this is absurd. Swapping 10,000 USDC for USDT shouldn't cost 11% in slippage.
+
+**Solution**: StableSwap (Curve) - optimized for pegged assets.
+
+### Capital Inefficiency
+
+In x*y=k, liquidity is spread across all prices from 0 to infinity. But most trading happens in a narrow range. If ETH trades between $1,000-2,000, liquidity at $10 or $100,000 is wasted.
+
+```
+ETH/USDC pool with $10M liquidity
+ETH price: $1,500
+
+Liquidity actually useful for ±5% trades: ~$500K
+Liquidity sitting unused: ~$9.5M
+```
+
+**Solution**: Concentrated Liquidity (Uniswap V3) - LPs choose their price ranges.
+
+### Impermanent Loss
+
+When prices change, LPs end up with less value than if they'd just held:
+
+```
+Initial deposit: 1 ETH + 1,000 USDC = $2,000
+ETH doubles to $2,000
+
+If you held: 1 ETH ($2,000) + 1,000 USDC = $3,000
+In the pool: 0.707 ETH ($1,414) + 1,414 USDC = $2,828
+
+Impermanent loss: $172 (5.7%)
+```
+
+The more volatile the pair, the worse the loss. LPs need high fee income to compensate.
+
+**Solution**: Oracle-integrated AMMs (GMX model) - use external prices, eliminate IL.
+
+### Fixed Ratios
+
+Constant product forces 50/50 value splits. But what if you want exposure to multiple assets in different ratios? An index fund of 60% BTC, 30% ETH, 10% SOL?
+
+**Solution**: Weighted Pools (Balancer) - custom ratios, multiple assets.
+
+<ArticleSection name="The AMM Landscape Today" id="landscape" level="h2" />
+
+### Solana's AMM Ecosystem
+
+Solana's high throughput enabled both AMM innovation and order book revival:
+
+**Constant Product**:
+- Raydium (standard pools)
+- Orca (legacy pools)
+
+**Concentrated Liquidity**:
+- Orca Whirlpools
+- Raydium CLMM
+
+**Hybrid Order Book + AMM**:
+- Phoenix
+- OpenBook
+
+**Oracle-Integrated**:
+- Jupiter Perps (perpetuals)
+- Drift (perpetuals)
+
+### The Pattern
+
+Each AMM design optimizes for different tradeoffs:
+
+| Design | Optimizes For | Sacrifices |
+|--------|--------------|------------|
+| Constant Product | Simplicity, any pair | Capital efficiency |
+| StableSwap | Pegged assets | Volatile pair handling |
+| Concentrated Liquidity | Capital efficiency | LP complexity, JIT MEV |
+| Weighted Pools | Custom exposure | Concentrated liquidity |
+| Oracle-Integrated | Zero IL | Oracle dependency |
+
+There's no universal best. The right AMM depends on the assets, the users, and the use case.
+
+<ArticleSection name="What's Ahead" id="whats-ahead" level="h2" />
+
+This course dives deep into each major AMM architecture:
+
+1. **StableSwap**: Curve's invariant, amplification parameter, and why it dominates stablecoin trading
+2. **Concentrated Liquidity**: Uniswap V3's tick system, the math, and implementation details
+3. **Weighted Pools**: Balancer's multi-asset approach and liquidity bootstrapping
+4. **Oracle-Integrated AMMs**: GMX model, zero slippage, and the tradeoffs
+5. **Emerging Designs**: What's next in AMM architecture
+
+If you haven't already, make sure you understand constant product AMMs from the [Introduction to DeFi](/courses/introduction-to-defi/amms-and-constant-product) course. Everything that follows builds on that foundation.
+
+Next: [StableSwap](/courses/amm-architectures/stableswap) - Curve's innovation for pegged assets.

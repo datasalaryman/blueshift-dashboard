@@ -1,0 +1,69 @@
+import { ArticleSection } from "../../../../components/ArticleSection/ArticleSection";
+
+# Conclusion
+
+You've learned how to integrate price oracles into Solana programs. The consensus problem, Pyth's institutional data, Switchboard's flexibility, and the advanced patterns that keep protocols safe.
+
+But knowing how oracles work isn't enough. You need to internalize why they fail.
+
+<ArticleSection name="The Oracle Mindset" id="oracle-mindset" level="h2" />
+
+### Assume Failure
+
+Every oracle will fail eventually. Pyth has had outages. Switchboard oracles have submitted bad data. Networks get congested. Publishers go offline.
+
+Your protocol needs to handle:
+- **Stale prices**: What happens when the last update was 5 minutes ago?
+- **Wide confidence**: What if publishers disagree by 10%?
+- **Complete outage**: What if no oracle responds?
+
+The protocols that survive aren't optimistic. They're paranoid.
+
+### Trust Nothing
+
+Raw oracle data is a suggestion, not a fact. Before using any price:
+
+```rust
+// The paranoid checklist
+fn validate_price(price: &Price, config: &Config) -> Result<()> {
+    // 1. Is it fresh?
+    require!(price.publish_time + config.max_age >= now, Stale);
+    
+    // 2. Is confidence acceptable?
+    require!(price.conf < price.price / 50, TooUncertain);
+    
+    // 3. Is it within sanity bounds?
+    require!(price.price > config.min_price, TooLow);
+    require!(price.price < config.max_price, TooHigh);
+    
+    // 4. Does it match other sources?
+    let other_price = get_backup_price()?;
+    require!(deviation(price, other_price) < 100, Mismatch); // 1%
+    
+    Ok(())
+}
+```
+
+<ArticleSection name="The Bigger Picture" id="bigger-picture" level="h2" />
+
+Oracles are the eyes of your protocol. They're the only way on-chain code knows about the outside world.
+
+If your eyes lie to you, everything you do based on that information is wrong. Bad prices lead to bad liquidations, unfair trades, and drained treasuries.
+
+The oracle attacks we've discussed, Mango Markets, various flash loan exploits, they all share one pattern: the protocol trusted oracle data it shouldn't have.
+
+Build your oracle integration like an attacker is watching. Because they are.
+
+<ArticleSection name="What's Next" id="whats-next" level="h2" />
+
+You now have the foundation to build oracle-dependent protocols safely. Some directions to explore:
+
+**Deeper Pyth integration**: Pyth's price scheduling, on-demand updates, and multi-chain support.
+
+**Custom Switchboard feeds**: Build oracles for data Pyth doesn't cover, sports, weather, on-chain metrics.
+
+**MEV-aware oracle usage**: How oracle updates interact with MEV, and how to protect users.
+
+The fundamentals don't change. Validate everything. Trust nothing. Build for failure.
+
+Now go build something that survives.

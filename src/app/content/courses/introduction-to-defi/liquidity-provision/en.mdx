@@ -42,9 +42,9 @@ The first deposit is special. There's no existing ratio to match. How many LP to
 The simplest approach: mint LP tokens equal to the total value deposited. For a single-asset vault, this is straightforward:
 
 ```rust
-pub fn initial_mint(amount: u64) -> u64 {
+pub fn initial_mint(deposit_a: u64, deposit_b: u64) -> u64 {
     // First depositor gets LP tokens equal to their deposit
-    amount
+    std::cmp::min(deposit_a, deposit_b)
 }
 ```
 

@@ -2,231 +2,169 @@ import { ArticleSection } from "../../../../components/ArticleSection/ArticleSec
 
 # AMMs & The Constant Product Curve
 
-Traditional exchanges use order books: buyers post bids while sellers post asks, and trades happen when prices match. This works great when you have market makers: professionals who keep the book filled with orders on both sides.
+How do you trade tokens without a counterparty?
 
-But order books need liquidity providers who actively manage positions.
+Traditional exchanges match buyers with sellers. But on-chain, there's no order book, no market maker refreshing quotes, no one on the other side of your trade.
 
-AMMs flipped the model. Instead of matching orders, trades execute against a pool of tokens following a mathematical curve. 
+AMMs solve this with a simple idea: replace the counterparty with math: A pool holds two tokens and a formula determines the price meaning you can always trade against the formula, without needing anyone else.
 
-Anyone can deposit tokens and earn fees without any active management required thanks to a simple formula that makes permissionless liquidity possible.
+The formula that powers most AMMs is the constant product formula: `x * y = k`
 
 <ArticleSection name="The Constant Product Formula" id="constant-product" level="h2" />
 
-### x * y = k
+### The Core Idea
 
-The constant product formula is elegant:
+A pool holds reserves of two tokens and the product of those reserves must stay constant:
 
 ```
 x * y = k
+
+x = reserve of token A
+y = reserve of token B  
+k = constant (the product)
 ```
+
+When you swap, you actually just deposit one token to withdraw the other. The pool adjusts reserves, but `k` stays the same.
+
+```
+Before: 1000 SOL × 100,000 USDC = 100,000,000
+After swap: 1010 SOL × 99,010 USDC = 100,000,000 (same k)
+```
+
+The constraint `x * y = k` creates a curve and every point on that curve is a valid pool state; Swapping is just moving along the curve.
+
+This formula means that the spot price is actually just the ratio of reserves:
+
+```
+Price of SOL = USDC reserves / SOL reserves
+            = 100,000 / 1000
+            = 100 USDC per SOL
+```
+
+If someone buys SOL (removes SOL, adds USDC), there's less SOL and more USDC. This means that thee ratio changes and with it "SOL gets more expensive".
+
+<ArticleSection name="The Swap Formula" id="swap-formula" level="h2" />
+
+You might want to sell 10 SOL on a SOL-USDC AMM. How much USDC do you get?
+
+Start with the idea that the product must stay constant.
+
+```
+Before swap: x × y = k
+After swap:  (x + Δx) × (y - Δy) = k
 
 Where:
-- `x` = amount of token A in the pool
-- `y` = amount of token B in the pool
-- `k` = a constant that must stay the same (or grow from fees)
-
-When you swap, you add tokens to one side and remove from the other. But the product must remain constant.
-
-```rust
-// Pool starts with 1000 SOL and 100,000 USDC
-let reserve_sol: u64 = 1_000_000_000_000;  // 1000 SOL (9 decimals)
-let reserve_usdc: u64 = 100_000_000_000;   // 100,000 USDC (6 decimals)
-
-let k = reserve_sol as u128 * reserve_usdc as u128;
-// k = 100,000,000,000,000,000,000,000
+  Δx = amount you're adding (10 SOL)
+  Δy = amount you're receiving (? USDC)
 ```
 
-### Price as a Ratio
+Solving for Δy:
 
-The price at any moment is the ratio of reserves:
-
-```rust
-// Price of SOL in USDC
-let price = reserve_usdc / reserve_sol;
-// 100,000 / 1000 = 100 USDC per SOL
+```
+(x + Δx) × (y - Δy) = x × y
+y - Δy = (x × y) / (x + Δx)
+Δy = y - (x × y) / (x + Δx)
+Δy = y × Δx / (x + Δx)
 ```
 
-But this isn't the price you get when you trade. That's where the math gets interesting.
-
-### The Mathematics of a Swap
-
-How much USDC should you get for 10 SOL at $100/SOL? Intuitively, $1000. 
-
-But let's see what actually happens:
+The swap output formula:
 
 ```rust
-// Before swap
-let x = 1000u128;  // SOL reserves (simplified, no decimals)
-let y = 100_000u128;  // USDC reserves
-let k = x * y;  // k = 100,000,000
-
-// You add 10 SOL
-let dx = 10u128;
-let new_x = x + dx;  // 1010 SOL
-
-// Solve for new_y: new_x * new_y = k
-let new_y = k / new_x;  // 100,000,000 / 1010 = 99,009.90...
-
-// You receive the difference
-let dy = y - new_y;  // 100,000 - 99,009 = 990 USDC (rounded down)
+output = (reserve_out * amount_in) / (reserve_in + amount_in)
 ```
 
-The formula simplifies to:
+So if we plug real numbers in the formula:
+
+```
+Pool: 1000 SOL, 100,000 USDC
+You sell: 10 SOL
+
+output = (100,000 × 10) / (1000 + 10)
+       = 1,000,000 / 1010
+       = 990.09 USDC
+```
+
+Wait, but as we said before the spot price of SOL is determined `USDC reserves / SOL reserves`; this means that we should've got 1,000 USDC but we got only 990.
+
+The missing 10 USDC is what we call **price impact**: the cost of moving along the curve. Bigger trades, with thin liqudiity move further along the curve, giving you worse prices.
+
+### Why the Formula Works
+
+The genius of `x * y = k`:
+
+1. **Infinite liquidity**: The curve never touches the axes. You can always trade (though prices get extreme).
+
+2. **Self-correcting prices**: If the pool price diverges from market price, arbitrageurs profit by correcting it.
+
+3. **No counterparty needed**: The math is the market maker.
+
+<ArticleSection name="Fees" id="fees" level="h2" />
+
+As always, Crypto is an exercise of design mechanism. 
+
+If we didn't add any fees to the AMM, LPs, that are the main counterparty powering this primitive, will not have any incentives in depositing tokens, since they would just withdraw the same value with a slithgly different token allocation.
+
+Fees fix this; most AMM take a cut for their LP before calculating the output:
 
 ```rust
-// Output amount formula
-// dy = (y * dx) / (x + dx)
-let output = (reserve_out * amount_in) / (reserve_in + amount_in);
+const FEE_BPS: u64 = 30;  // 0.3%
+
+let amount_after_fee = amount_in * (10_000 - FEE_BPS) / 10_000;
+let output = (reserve_out * amount_after_fee) / (reserve_in + amount_after_fee);
 ```
 
-You put in 10 SOL expecting ~1000 USDC but you got 990. Where did the other $10 go?
+The fee stays in the pool; this means that after many swaps, the pool has more total value than what LPs deposited.
 
-The curve took it as fee for moving the inflection point away from the "equilibrium". 
+> Round output DOWN. Protocol should never give users more than the math says.
 
-By adding SOL to the pool, you shifted the ratio. The pool had to give you less USDC to maintain `x * y = k`. This is what we call **price impact**.
+<ArticleSection name="Price Impact & Slippage" id="slippage" level="h2" />
 
-### Fee Integration
+Since the curve is hyperbolic, small trades barely move along it while large trades, in thin liquidity, travel far, hitting progressively worse prices.
 
-Without fees, `k` stays constant forever. LPs deposit tokens, traders swap, and LPs withdraw exactly what they put in. Why would anyone provide liquidity?
+```
+Pool: 1000 SOL, 100,000 USDC (spot price: 100)
 
-Fees solve this. Real AMMs take a cut from each swap before calculating output:
-
-```rust
-const FEE_BPS: u64 = 30;  // 0.3% fee
-const BPS_DENOMINATOR: u64 = 10_000;
-
-// Apply fee to input
-let amount_in_after_fee = amount_in * (BPS_DENOMINATOR - FEE_BPS) / BPS_DENOMINATOR;
-
-// Calculate output with fee-adjusted input
-let output = (reserve_out * amount_in_after_fee) / (reserve_in + amount_in_after_fee);
+Sell 10 SOL:   get 990 USDC   (effective price: 99.0)   -1.0%
+Sell 100 SOL:  get 9,091 USDC (effective price: 90.9)   -9.1%
+Sell 500 SOL:  get 33,333 USDC (effective price: 66.7)  -33.3%
 ```
 
-The fee stays in the pool, increasing `k` over time. This is how LPs earn yield.
+This is a mechanism to protects LPs. If someone could buy unlimited tokens at spot price, they'd drain the pool and suffer from no price discovery and bad flow.
 
-> Always round the output DOWN. The protocol should never give users more than they're mathematically owed.
+### Slippage Protection
 
-<ArticleSection name="Slippage & Price Impact" id="slippage" level="h2" />
+Other than price impact, we have another possible mechanism that could give us a worst trade than what we expect. 
 
-### Why Large Trades Hurt
-
-The constant product curve is hyperbolic. Small trades barely move the price. Large trades move it dramatically.
-
-```rust
-// 10 SOL swap: ~990 USDC out (99 USDC per SOL effective price)
-// 100 SOL swap: ~9090 USDC out (90.9 USDC per SOL effective price)
-// 500 SOL swap: ~33,333 USDC out (66.6 USDC per SOL effective price)
-```
-
-The math:
-
-```rust
-fn calculate_price_impact(
-    reserve_in: u128,
-    reserve_out: u128,
-    amount_in: u128,
-) -> u128 {
-    let spot_price = (reserve_out * PRECISION) / reserve_in;
-    let output = (reserve_out * amount_in) / (reserve_in + amount_in);
-    let effective_price = (output * PRECISION) / amount_in;
-
-    // Price impact as percentage (in BPS)
-    ((spot_price - effective_price) * 10_000) / spot_price
-}
-```
-
-This is because we want to protect the LPs by trying to get them to remain in balance at the price where they provided liquidity. And in case this is not done because the price has diverged too much, rewards them with fees.
-
-### Minimum Output Protection
-
-To protect against:
-1. Price movement between transaction submission and execution
-2. Front-running attacks (more on this in Lesson 3)
-
-users usually set a `min_amount_out`:
+Between submitting a transaction and execution, prices can move. This is what we call **slippage** and most AMM protect their users with this simple formula:
 
 ```rust
 pub fn swap(
     ctx: Context<Swap>,
     amount_in: u64,
-    minimum_out: u64,  // Slippage protection
+    min_out: u64,  // Revert if output is less than this
 ) -> Result<()> {
-    let output = calculate_output(
-        ctx.accounts.pool.reserve_a,
-        ctx.accounts.pool.reserve_b,
-        amount_in,
-    );
-
-    require!(output >= minimum_out, ErrorCode::SlippageExceeded);
-
+    let output = calculate_swap_output(amount_in, reserves);
+    
+    require!(output >= min_out, SlippageExceeded);
+    
     // Execute swap...
-    Ok(())
 }
 ```
 
-A typical frontend calculates expected output, then sets `minimum_out` to 99% of that (1% slippage tolerance).
+Frontends typically set `min_out` to 99% of expected output (1% slippage tolerance).
 
-<ArticleSection name="Curve Evolution" id="curve-evolution" level="h2" />
+<ArticleSection name="Beyond Constant Product" id="beyond-constant-product" level="h2" />
 
-The constant product formula works, but it's not optimal for all asset pairs. Here's how AMM math evolved:
+Constant product works for general-purpose trading, but it's not optimal for all assets:
 
-### Constant Sum: x + y = k
+| AMM Type | Best For | Key Insight |
+|----------|----------|-------------|
+| **Constant Product** (x*y=k) | General pairs | Simple, works everywhere |
+| **StableSwap** (Curve) | Pegged assets | 100x less slippage for stablecoins |
+| **Concentrated Liquidity** (Uni V3) | High-volume pairs | LPs choose price ranges |
+| **Weighted Pools** (Balancer) | Portfolios | Custom ratios like 80/20 |
+| **Oracle-Integrated** (GMX) | Perpetuals | Zero slippage, oracle pricing |
 
-```rust
-// Constant sum formula
-let output = amount_in;  // 1:1 exchange rate always
-```
+Each makes different tradeoffs. Constant product's strength is simplicity: five characters that power billions in daily volume.
 
-Perfect for stablecoins that should trade 1:1. But a single large trade can drain one side completely. Not practical alone.
-
-### StableSwap (Curve)
-
-Curve's innovation: a hybrid formula that behaves like constant sum near the peg (low slippage for stable pairs) but transitions to constant product at extremes (preventing pool drainage).
-
-```
-A * (x + y) + xy = A * D + (D^2 / 4)
-```
-
-Where `A` is an amplification factor. Higher `A` = flatter curve = lower slippage for pegged assets.
-
-```rust
-// Simplified StableSwap calculation (real implementation is iterative)
-fn stable_swap_output(
-    reserve_in: u128,
-    reserve_out: u128,
-    amount_in: u128,
-    amp: u128,  // Amplification factor
-) -> u128 {
-    // This requires iterative solving - Newton's method typically
-    // Omitted for clarity, but the key insight:
-    // High amp = trades near 1:1 for balanced pools
-    // Low amp = behaves like constant product
-}
-```
-
-### Concentrated Liquidity
-
-Uniswap V3's innovation: let LPs concentrate liquidity in specific price ranges instead of spreading across 0 to infinity.
-
-```rust
-// Instead of one global reserve, liquidity is stored per "tick"
-struct Position {
-    lower_tick: i32,    // Price range lower bound
-    upper_tick: i32,    // Price range upper bound
-    liquidity: u128,    // Concentrated liquidity in this range
-}
-```
-
-Benefits: 10-100x capital efficiency. Drawbacks: active management required, impermanent loss amplified.
-
-> Concentrated liquidity math uses tick math and `sqrt_price` representations. Complex but powerful. We will cover this in advanced courses.
-
-### Weighted Pools
-
-Balancer-style pools generalize constant product:
-
-```
-x^w1 * y^w2 = k
-```
-
-A 80/20 pool keeps 80% of value in token A, 20% in token B. Useful for token launches or portfolio exposure.
+> **Want to go deeper?** The [AMM Architectures](/courses/amm-architectures) course covers each design in detail.

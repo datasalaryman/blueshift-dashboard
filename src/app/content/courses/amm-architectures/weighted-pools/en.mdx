@@ -1,0 +1,385 @@
+import { ArticleSection } from "../../../../components/ArticleSection/ArticleSection";
+
+# Weighted Pools
+
+In March 2020, Balancer launched with a question: why are all AMMs 50/50?
+
+Constant product (x*y=k) forces equal value of both tokens. But what if you want 80% ETH and 20% USDC? What if you want a pool of 8 different tokens? What if you want an on-chain index fund?
+
+Balancer generalized the AMM formula to support arbitrary weights and multiple assets. It's less famous than Uniswap but powers use cases that constant product simply can't handle.
+
+<ArticleSection name="Beyond 50/50" id="beyond-5050" level="h2" />
+
+### The Limitation of Constant Product
+
+In x*y=k pools:
+- Token A value = Token B value (always)
+- Two tokens maximum per pool
+- LPs must deposit equal values of both
+
+This is fine for trading pairs. But consider these scenarios:
+
+**Index exposure**: You want 60% BTC, 30% ETH, 10% SOL exposure. With Uniswap, you'd need multiple positions across multiple pools.
+
+**Treasury management**: Your protocol holds 80% governance token, 20% stables. You want to provide liquidity without selling most of your tokens.
+
+**Token launches**: You're launching a token and want to start with 90% your token, 10% ETH, gradually shifting to 50/50.
+
+Constant product can't do any of this.
+
+### Balancer's Insight
+
+Generalize the invariant to support:
+1. Arbitrary weights (not just 50/50)
+2. Multiple tokens (not just pairs)
+3. Self-balancing portfolios
+
+<ArticleSection name="The Weighted Math" id="weighted-math" level="h2" />
+
+### The Invariant
+
+Balancer uses the weighted geometric mean:
+
+```
+V = Π(B_i ^ W_i)
+
+Where:
+- V = invariant value
+- B_i = balance of token i
+- W_i = weight of token i
+- Σ(W_i) = 1 (weights sum to 100%)
+```
+
+For a two-token 50/50 pool:
+```
+V = B_0^0.5 * B_1^0.5 = sqrt(B_0 * B_1)
+
+This is exactly sqrt(x*y) = sqrt(k)
+```
+
+Constant product is a special case of weighted pools!
+
+### Weight Examples
+
+**80/20 ETH/USDC**:
+```
+V = ETH^0.8 * USDC^0.2
+
+Pool: 100 ETH ($200K) + 50,000 USDC ($50K)
+Total value: $250K
+ETH exposure: 80%
+USDC exposure: 20%
+```
+
+**Three-token 60/30/10**:
+```
+V = BTC^0.6 * ETH^0.3 * SOL^0.1
+
+Pool: $600K BTC + $300K ETH + $100K SOL
+Total: $1M
+```
+
+### Spot Price Formula
+
+The spot price between any two tokens:
+
+```
+SP_i/j = (B_j / W_j) / (B_i / W_i)
+
+Where:
+- SP_i/j = spot price of token i in terms of token j
+- B = balance
+- W = weight
+```
+
+For 80/20 ETH/USDC with 100 ETH and 50,000 USDC:
+```
+SP_ETH/USDC = (50000 / 0.2) / (100 / 0.8)
+           = 250000 / 125
+           = 2000 USDC per ETH
+```
+
+### Swap Output Formula
+
+For an exact input swap:
+
+```
+A_o = B_o * (1 - (B_i / (B_i + A_i))^(W_i/W_o))
+
+Where:
+- A_o = amount out
+- A_i = amount in
+- B_o = balance out (before swap)
+- B_i = balance in (before swap)
+- W_i = weight in
+- W_o = weight out
+```
+
+The exponent `W_i/W_o` is key. In 50/50 pools, this equals 1. In weighted pools, it changes the price curve.
+
+<ArticleSection name="Price Curves by Weight" id="price-curves" level="h2" />
+
+### How Weights Affect Price Impact
+
+Different weights create different curves:
+
+**50/50 (standard AMM)**:
+```
+Selling 10% of token A balance:
+→ ~9% price impact
+```
+
+**80/20 (heavy token A)**:
+```
+Selling 10% of token A balance:
+→ ~2.5% price impact (on A)
+→ Token A is "heavier", harder to move
+
+Selling 10% of token B balance:
+→ ~30% price impact (on B)
+→ Token B is "lighter", moves easily
+```
+
+### Why This Matters
+
+For an 80/20 pool where you want to maintain exposure:
+- Large sells of the 80% token cause less slippage
+- The pool naturally resists rebalancing away from target weights
+- Ideal for treasuries that want to maintain token allocation
+
+### Impermanent Loss by Weight
+
+IL is reduced for the heavier token:
+
+```
+50/50 pool, 2x price change: 5.7% IL
+80/20 pool, 2x price change of 80% token: ~1.0% IL
+80/20 pool, 2x price change of 20% token: ~16% IL
+```
+
+The heavy token has natural protection. The light token has amplified exposure.
+
+<ArticleSection name="Multi-Token Pools" id="multi-token" level="h2" />
+
+### Eight Tokens, One Pool
+
+Balancer supports up to 8 tokens per pool:
+
+```
+Example: DeFi Index Pool
+- 20% ETH
+- 20% BTC (wrapped)
+- 15% UNI
+- 15% AAVE
+- 10% CRV
+- 10% MKR
+- 5% COMP
+- 5% SNX
+```
+
+All tokens tradeable against each other. Single LP token represents exposure to all 8.
+
+### The Routing Problem
+
+With n tokens, there are n*(n-1)/2 possible pairs:
+- 2 tokens: 1 pair
+- 4 tokens: 6 pairs
+- 8 tokens: 28 pairs
+
+Every swap route exists. Trading COMP for SNX goes directly through the pool, not through multiple hops.
+
+### Gas Efficiency
+
+Despite complexity, multi-token swaps are gas-efficient:
+- All balances in one pool (one storage read)
+- Single invariant calculation
+- No multi-hop routing needed
+
+<ArticleSection name="Liquidity Bootstrapping Pools (LBPs)" id="lbps" level="h2" />
+
+### The Token Launch Problem
+
+Traditional token launches suffer from:
+- Bots front-running public sales
+- Initial price discovery chaos
+- Whales accumulating before retail
+
+### The LBP Solution
+
+LBPs use time-changing weights:
+
+```
+Launch day:
+Hour 0:  96% PROJECT / 4% USDC  (very high price)
+Hour 12: 80% PROJECT / 20% USDC (price falling)
+Hour 24: 70% PROJECT / 30% USDC (still falling)
+Hour 48: 50% PROJECT / 50% USDC (final state)
+```
+
+As weights shift, the price naturally decreases even without sells. This creates a Dutch auction effect.
+
+### Why It Works
+
+**Front-running deterred**: Buying early means buying at highest price. No advantage to being first.
+
+**Price discovery**: Market finds equilibrium as weights shift. No arbitrary starting price.
+
+**Fair distribution**: Retail can buy throughout the sale at fair prices.
+
+**No dumps**: Team sells gradually through weight change, not all at once.
+
+### LBP Math
+
+The price with changing weights:
+
+```
+Price(t) = (B_collateral / W_collateral(t)) / (B_token / W_token(t))
+
+As W_token decreases and W_collateral increases:
+→ Price naturally falls
+```
+
+<ArticleSection name="Smart Pools and Managed Pools" id="managed-pools" level="h2" />
+
+### Beyond Static Weights
+
+Balancer V2 introduced controller contracts that can modify pools:
+
+**Weight changes**: Gradually shift weights over time (like LBPs)
+**Fee changes**: Adjust swap fees based on conditions
+**Token additions**: Add new tokens to existing pools
+**Pause trading**: Emergency stops
+
+### Asset Managers
+
+Pools can delegate idle assets to external protocols:
+
+```
+Weighted pool: $10M TVL
+During normal operation: $2M active for swaps
+Idle capital: $8M
+
+Asset manager:
+→ Lends $8M on Aave
+→ Earns yield
+→ Returns capital when needed for swaps
+```
+
+This makes LP capital more productive but adds smart contract risk.
+
+### Managed Pool Use Cases
+
+**Active index funds**: Rebalance weights based on market cap or other metrics
+**Yield-optimized pools**: Idle assets earning yield
+**Conditional pools**: Different behavior based on market conditions
+
+<ArticleSection name="Implementations" id="implementations" level="h2" />
+
+### Balancer (Ethereum, Polygon, Arbitrum)
+
+The original weighted pool protocol:
+- V1: Basic weighted pools (2020)
+- V2: Vault architecture, asset managers, flexible pools (2021)
+- BAL token for governance
+
+Key innovation: The Vault. All Balancer pools share a single contract for token management, reducing gas costs and enabling flash loans across all pools.
+
+### Symmetric (Solana)
+
+Balancer on Solana. Less adoption than Orca/Raydium but supports weighted pools for specific use cases.
+
+### Implementation Considerations
+
+**Exponentiation**: Weighted math requires computing `x^w` where w is fractional. Use logarithms:
+
+```rust
+// x^w = exp(w * ln(x))
+fn power(x: u128, w: u128, precision: u128) -> u128 {
+    let ln_x = ln(x, precision);
+    let w_ln_x = (w * ln_x) / precision;
+    exp(w_ln_x, precision)
+}
+```
+
+**Precision**: More tokens = more precision needed. 18+ decimal precision is common.
+
+**Weight normalization**: Ensure weights sum to exactly 1.0 (or 10^18 in fixed point).
+
+<ArticleSection name="When to Use Weighted Pools" id="when-to-use" level="h2" />
+
+### Ideal Use Cases
+
+**Protocol treasuries**: Maintain target allocation while earning fees
+
+```
+Treasury: 80% PROTOCOL_TOKEN / 20% ETH
+- Provides liquidity
+- Earns fees
+- Maintains exposure to protocol token
+- Limited IL on main holding
+```
+
+**Index products**: On-chain index funds tracking multiple assets
+
+**Token launches**: LBPs for fair, bot-resistant distribution
+
+**Portfolio pools**: Single LP token for diversified exposure
+
+### When NOT to Use
+
+**Maximum trading efficiency**: 50/50 concentrated liquidity is more efficient for pure trading pairs.
+
+**Simple token swaps**: Overhead not worth it for basic pairs.
+
+**Highly correlated assets**: StableSwap is better for assets that should trade 1:1.
+
+### Comparison
+
+| Feature | Constant Product | Weighted | Concentrated |
+|---------|-----------------|----------|--------------|
+| Token limit | 2 | 8 | 2 |
+| Weight flexibility | 50/50 only | Any ratio | 50/50 only |
+| Capital efficiency | Low | Medium | High |
+| Complexity | Low | Medium | High |
+| Use case | Trading | Portfolios | High volume trading |
+
+<ArticleSection name="The Value Proposition" id="value-prop" level="h2" />
+
+### Self-Rebalancing Portfolios
+
+The killer feature: weighted pools automatically rebalance.
+
+```
+Target: 60% ETH / 40% BTC
+ETH price doubles relative to BTC
+
+Without rebalancing: 75% ETH / 25% BTC
+With weighted pool: Arbitrage naturally sells ETH, buys BTC
+Result: Returns to ~60% ETH / 40% BTC
+
+You get paid fees to rebalance instead of paying fees.
+```
+
+### Fees Instead of Costs
+
+Traditional portfolio rebalancing costs:
+- Exchange fees
+- Slippage
+- Gas
+- Time/attention
+
+With weighted pools, arbitrageurs rebalance for you and pay you fees. Your portfolio stays balanced while generating yield.
+
+<ArticleSection name="Key Takeaways" id="takeaways" level="h2" />
+
+1. **Weighted pools** generalize constant product to arbitrary token weights
+2. **The invariant** is the weighted geometric mean: `V = Π(B_i ^ W_i)`
+3. **Multi-token pools** support up to 8 tokens trading against each other
+4. **Heavier tokens** have lower slippage and IL protection
+5. **LBPs** use changing weights for fair token launches
+6. **Self-rebalancing**: Pools maintain target allocation automatically
+7. **Best for portfolios**, treasuries, and token launches, not raw trading efficiency
+
+Weighted pools solve problems that other AMM designs can't. They're not the most capital efficient for trading, but they enable use cases like on-chain index funds and treasury management that don't exist elsewhere.
+
+Next: [Oracle-Integrated AMMs](/courses/amm-architectures/oracle-integrated-amms) - Eliminating impermanent loss with external price feeds.

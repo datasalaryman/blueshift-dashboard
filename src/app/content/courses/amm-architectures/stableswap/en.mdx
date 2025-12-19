@@ -1,0 +1,413 @@
+import { ArticleSection } from "../../../../components/ArticleSection/ArticleSection";
+
+# StableSwap
+
+In January 2020, Michael Egorov launched Curve Finance with a whitepaper that solved a specific problem: constant product AMMs are terrible for stablecoins.
+
+If USDC and USDT should both be worth $1, why does swapping 10,000 USDC for USDT cost 1% in slippage? The math was wrong for the use case.
+
+Curve's StableSwap invariant changed everything. Today, Curve handles billions in stablecoin volume with slippage measured in basis points, not percentages.
+
+<ArticleSection name="The Problem with Constant Product" id="the-problem" level="h2" />
+
+### Why x*y=k Fails for Stablecoins
+
+Consider a USDC/USDT pool with $2M liquidity (1M USDC, 1M USDT):
+
+```
+Constant Product: x * y = k
+1,000,000 * 1,000,000 = 1,000,000,000,000
+
+Swap 100,000 USDC for USDT:
+New USDC: 1,100,000
+New USDT: k / 1,100,000 = 909,091
+USDT received: 1,000,000 - 909,091 = 90,909
+
+Expected: 100,000 USDT
+Actual: 90,909 USDT
+Slippage: 9.1%
+```
+
+A 9% loss to swap two assets that should be identical in value. This is unacceptable.
+
+### The Mathematical Reason
+
+Constant product creates a hyperbolic curve. Near the center (balanced pool), it's relatively flat. But it curves away quickly:
+
+```
+Price impact = (amount_in / reserve_in) * 100%
+
+For 10% of pool size:
+- 10% input → ~9% slippage
+- Scales roughly linearly
+```
+
+The curve treats USDC and USDT as if they could have any price ratio, providing liquidity for scenarios where USDC is worth 10x USDT or vice versa. For stablecoins, this liquidity is wasted.
+
+<ArticleSection name="The StableSwap Insight" id="insight" level="h2" />
+
+### Two Extreme Curves
+
+Consider two formulas:
+
+**Constant Sum**: `x + y = k`
+- Zero slippage: 1 USDC always equals exactly 1 USDT
+- Problem: Pool can be completely drained. If 1M USDC in pool, someone can take all of it for 1M USDT.
+
+**Constant Product**: `x * y = k`
+- Infinite liquidity: Pool can never be fully drained
+- Problem: High slippage, even for pegged assets
+
+What if you could blend them?
+
+### The StableSwap Invariant
+
+Curve's insight: create a formula that behaves like constant sum near the center (low slippage) but like constant product at the extremes (can't be drained).
+
+The invariant for two tokens:
+
+```
+A * n^n * (x + y) + D = A * D * n^n + D^(n+1) / (n^n * x * y)
+
+Where:
+- x, y = token reserves
+- n = number of tokens (2 for pairs)
+- D = total value when pool is balanced
+- A = amplification parameter (determines curve shape)
+```
+
+This looks complex. Let's break it down.
+
+### Understanding the Amplification Parameter (A)
+
+The amplification parameter `A` controls how "stable" the curve is:
+
+**A = 0**: Pure constant product (x*y=k)
+**A = ∞**: Pure constant sum (x+y=k)
+**A = 100-2000**: Typical range for stablecoin pools
+
+```
+Low A (10):
+- More curved, approaches constant product
+- Higher slippage, but safer during depegs
+- Better for loosely pegged assets
+
+High A (2000):
+- Very flat, approaches constant sum
+- Near-zero slippage within range
+- Dangerous if assets depeg significantly
+```
+
+### Visualizing the Curve
+
+```
+                    Constant Sum (x+y=k)
+                    /
+                   /
+                  /    StableSwap curve
+                 /   /   (high A)
+                /   /
+               /  /
+              / /
+             //
+            /------------ Constant Product (x*y=k)
+           /
+```
+
+Near balance, StableSwap follows constant sum (flat, low slippage). As imbalance grows, it bends toward constant product (can't be drained).
+
+<ArticleSection name="The Math Deep Dive" id="math" level="h2" />
+
+### Simplified Two-Token Formula
+
+For a two-token pool, the StableSwap invariant simplifies to:
+
+```
+A * 4 * (x + y) + D = A * D * 4 + D³ / (4 * x * y)
+```
+
+Rearranging to solve for the output amount when swapping:
+
+```
+Given: swap dx of token X for token Y
+Find: dy (amount of Y received)
+
+1. Calculate new x: x_new = x + dx
+2. Solve invariant for y_new (requires iteration)
+3. dy = y - y_new
+```
+
+### Newton's Method for Solving
+
+The invariant can't be solved algebraically for y. Implementations use Newton's method:
+
+```rust
+fn get_y(x_new: u128, d: u128, a: u128) -> u128 {
+    // StableSwap invariant rearranged for y
+    // A * 4 * (x + y) + D = A * D * 4 + D³ / (4 * x * y)
+    
+    let ann = a * 4; // A * n^n where n=2
+    
+    // Initial guess
+    let mut y = d;
+    
+    // Newton's method iteration
+    for _ in 0..256 {
+        let y_prev = y;
+        
+        // f(y) and f'(y) for Newton's method
+        let numerator = y * y + (ann * x_new + d * d * d / (4 * x_new) - ann * d - y);
+        let denominator = 2 * y + ann * x_new / d - d * d / (4 * x_new * y) - 1;
+        
+        y = y - numerator / denominator;
+        
+        // Convergence check
+        if y.abs_diff(y_prev) <= 1 {
+            break;
+        }
+    }
+    
+    y
+}
+```
+
+### Computing D (Invariant Value)
+
+When the pool is balanced (equal values of each token), D equals the total value. Computing D also requires iteration:
+
+```rust
+fn get_d(reserves: &[u128], a: u128) -> u128 {
+    let n = reserves.len() as u128;
+    let sum: u128 = reserves.iter().sum();
+    
+    if sum == 0 {
+        return 0;
+    }
+    
+    let ann = a * n.pow(n as u32);
+    let mut d = sum;
+    
+    for _ in 0..256 {
+        let d_prev = d;
+        
+        // D_P = D^(n+1) / (n^n * prod(reserves))
+        let mut d_p = d;
+        for reserve in reserves {
+            d_p = d_p * d / (reserve * n);
+        }
+        
+        // Newton's method
+        let numerator = (ann * sum + d_p * n) * d;
+        let denominator = (ann - 1) * d + (n + 1) * d_p;
+        d = numerator / denominator;
+        
+        if d.abs_diff(d_prev) <= 1 {
+            break;
+        }
+    }
+    
+    d
+}
+```
+
+<ArticleSection name="Slippage Comparison" id="slippage" level="h2" />
+
+### Real Numbers
+
+Same scenario: $2M pool, swap 100,000 USDC for USDT:
+
+**Constant Product (A=0)**:
+```
+Slippage: 9.1%
+Received: 90,909 USDT
+```
+
+**StableSwap (A=100)**:
+```
+Slippage: 0.15%
+Received: 99,850 USDT
+```
+
+**StableSwap (A=1000)**:
+```
+Slippage: 0.015%
+Received: 99,985 USDT
+```
+
+The difference is dramatic. For stablecoin swaps, StableSwap is 100-1000x more efficient.
+
+### Trade Size Scaling
+
+| Trade Size | Constant Product | StableSwap (A=100) |
+|------------|------------------|---------------------|
+| 1% of pool | 0.99% | 0.001% |
+| 5% of pool | 4.76% | 0.025% |
+| 10% of pool | 9.09% | 0.10% |
+| 25% of pool | 20.0% | 0.63% |
+| 50% of pool | 33.3% | 2.5% |
+
+StableSwap maintains low slippage for much larger trades.
+
+<ArticleSection name="The Depeg Problem" id="depeg" level="h2" />
+
+### When Stablecoins Aren't Stable
+
+High A values assume assets stay pegged. When they don't, bad things happen.
+
+**March 2023: USDC Depeg**
+
+Silicon Valley Bank collapsed. Circle had $3.3B in deposits there. USDC briefly traded at $0.87.
+
+Curve pools with high A values experienced:
+- Massive imbalance as traders dumped USDC
+- Slippage spiked despite the flat curve
+- LPs took significant losses
+
+### Why High A is Dangerous During Depegs
+
+```
+Pool: 1M USDC, 1M USDT (A=1000)
+USDC depegs to $0.90
+
+Arbitrageurs dump USDC for USDT:
+- Pool becomes 1.5M USDC, 0.5M USDT
+- StableSwap curve is still relatively flat
+- More USDC can be dumped at near-1:1 rates
+- LPs are buying USDC at $1 when it's worth $0.90
+```
+
+The flat curve that enables low slippage also enables LPs to be drained during depegs.
+
+### Choosing A Values
+
+| Asset Type | Recommended A | Reasoning |
+|------------|---------------|-----------|
+| USDC/USDT | 200-500 | Highly stable, both regulated |
+| DAI/USDC | 100-200 | DAI has more volatility |
+| stETH/ETH | 50-100 | LST can depeg under stress |
+| FRAX/USDC | 100-200 | Algorithmic component |
+| Exotic stables | 10-50 | Higher risk of depeg |
+
+Lower A = more protection during depegs, but higher slippage during normal operation.
+
+<ArticleSection name="Multi-Token Pools" id="multi-token" level="h2" />
+
+### Beyond Two Tokens
+
+The StableSwap invariant generalizes to n tokens:
+
+```
+A * n^n * Σ(x_i) + D = A * D * n^n + D^(n+1) / (n^n * Π(x_i))
+```
+
+Curve's 3pool (USDC/USDT/DAI) uses this formula. Benefits:
+- Trade any stablecoin for any other in one swap
+- Deeper combined liquidity
+- Single LP token for multi-asset exposure
+
+### The Metapool Pattern
+
+Problem: You have a new stablecoin (let's call it XUSD). You want liquidity against USDC, USDT, and DAI. Creating separate pairs fragments liquidity.
+
+Solution: Metapools. Pair XUSD against the 3pool LP token:
+
+```
+Metapool: XUSD / 3CRV (3pool LP token)
+
+To swap XUSD → USDT:
+1. XUSD → 3CRV (metapool)
+2. 3CRV → USDT (3pool)
+```
+
+This concentrates liquidity while enabling trading against all major stablecoins.
+
+<ArticleSection name="Implementations" id="implementations" level="h2" />
+
+### Curve Finance (Ethereum)
+
+The original. Launched January 2020. Key innovations:
+- StableSwap invariant
+- ve-tokenomics (vote-escrowed CRV)
+- Gauge system for directing rewards
+- Factory pools for permissionless creation
+
+TVL: Peaked at $24B (2022), currently $2-3B.
+
+### Saber (Solana)
+
+Solana's primary stableswap. Launched 2021.
+- StableSwap invariant adapted for Solana
+- Concentrated on wrapped assets (wBTC, wETH variants)
+- SBR token for governance
+
+### Mercurial/Meteora (Solana)
+
+Started as stableswap, evolved to dynamic pools:
+- Multiple pool types including StableSwap
+- Dynamic fees based on volatility
+- Merged into Meteora for broader AMM functionality
+
+### Implementation Considerations
+
+**Precision**: StableSwap math requires high precision. Use u128 or u256 for intermediate calculations.
+
+**Iteration limits**: Newton's method must converge. Set reasonable iteration limits (256 is common).
+
+**A parameter changes**: Don't change A instantly. Ramp over time to prevent manipulation:
+
+```rust
+fn get_current_a(
+    initial_a: u64,
+    future_a: u64,
+    initial_time: i64,
+    future_time: i64,
+    current_time: i64,
+) -> u64 {
+    if current_time >= future_time {
+        return future_a;
+    }
+    
+    let time_elapsed = current_time - initial_time;
+    let time_total = future_time - initial_time;
+    
+    if future_a > initial_a {
+        initial_a + (future_a - initial_a) * time_elapsed / time_total
+    } else {
+        initial_a - (initial_a - future_a) * time_elapsed / time_total
+    }
+}
+```
+
+<ArticleSection name="When to Use StableSwap" id="when-to-use" level="h2" />
+
+### Ideal Use Cases
+
+**Stablecoins**: USDC/USDT, DAI/USDC, any dollar-pegged assets
+**Wrapped assets**: wBTC variants, bridged tokens that should be 1:1
+**Liquid staking tokens**: stETH/ETH, mSOL/SOL, jitoSOL/SOL
+**Synthetic assets**: Synths pegged to the same underlying
+
+### When NOT to Use StableSwap
+
+**Volatile pairs**: ETH/USDC would be catastrophic. The flat curve assumes assets stay near parity.
+**Uncertain pegs**: If you're not confident assets will stay pegged, use constant product or lower A.
+**New/untested assets**: High A with unproven assets is asking for trouble.
+
+### The Rule of Thumb
+
+> Use StableSwap when you believe the assets should trade 1:1 (or at a fixed ratio) and will continue to do so.
+
+If there's meaningful probability of permanent depeg, the efficiency gains aren't worth the risk.
+
+<ArticleSection name="Key Takeaways" id="takeaways" level="h2" />
+
+1. **StableSwap blends constant sum and constant product** to optimize for pegged assets
+2. **The amplification parameter (A)** controls the tradeoff between efficiency and depeg protection
+3. **Higher A = lower slippage** but more risk during depegs
+4. **Newton's method** is required to solve the invariant, both for swaps and computing D
+5. **Choose A carefully** based on asset stability and risk tolerance
+6. **Multi-token pools** concentrate liquidity across many stablecoins
+
+StableSwap solved stablecoin trading. But for volatile assets, we need a different approach: concentrating liquidity where it's actually used.
+
+Next: [Concentrated Liquidity](/courses/amm-architectures/concentrated-liquidity) - Uniswap V3's capital efficiency revolution.

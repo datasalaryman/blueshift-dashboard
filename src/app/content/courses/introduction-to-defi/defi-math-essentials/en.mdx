@@ -6,9 +6,8 @@ You might know how to write Solana programs. You understand accounts, PDAs, CPIs
 
 They're caused by math.
 
-One miscalculated decimal, one wrong rounding direction, and attackers drain millions. 
+Math precision is the #1 source of DeFi exploits; one miscalculated decimal, one wrong rounding direction, and attackers could potentially drain millions. 
 
-Math precision is the #1 source of DeFi exploits, and it's not because developers are bad at math; it's because blockchain math works differently than what you're used to.
 
 <ArticleSection name="The Precision Problem" id="precision-problem" level="h2" />
 
@@ -16,7 +15,7 @@ Math precision is the #1 source of DeFi exploits, and it's not because developer
 
 Solana programs should not use floating-point numbers. No `f32`, no `f64`.
 
-Floating-point arithmetic is non-deterministic across different hardware. The same calculation might produce slightly different results on different validators.
+Floating-point arithmetic is non-deterministic across different hardware; this means that the same calculation might produce slightly different results on different validators.
 
 So we must use integers. But how do you represent `0.5 SOL` with integers?
 
@@ -29,21 +28,23 @@ let sol_decimals: u8 = 9;
 // 500_000_000 / 10^9 = 0.5 SOL
 ```
 
-Every token has a decimal count; SOL has 9 decimals (the smallest part called lamport), USDC has 6. When you see "1 USDC" in a wallet, the on-chain value is actually `1_000_000`.
+Every token has a decimal count: SOL has 9 decimals (the smallest part called lamport), USDC has 6. When you see "1 USDC" in a wallet, the on-chain value is actually `1_000_000`.
 
 ### Fixed Point Arithmetic
 
-Not being able to use floating point creates other problems: for example, if you need to calculate a user's 33.33% share of a 1000 token pool:
+Not being able to use floating point creates other problems. 
+
+For example, if you need to calculate a user's 33.33% share of a 1000 token pool:
 
 ```rust
 let share = 1000 * 33 / 100;  // = 330, not 333.33
 ```
 
-You just lost 3.33 tokens to truncation. 
+You will lose 3.33 tokens to truncation; that's 0.33% of the pool gone in a single calculation. 
 
-That's 0.33% of the pool gone in a single calculation; At $10M TVL, that's $33,000 vanishing that multiplied by thousands of daily transactions means you've just built a protocol that bleeds value.
+At $10M TVL, that's $33,000 vanishing that multiplied by thousands of daily transactions means you've just built a protocol that bleeds value.
 
-By using just fixed-point arithmetic we solve this by scaling up before operations, preserving the decimals that integer division would destroy:
+By using fixed-point arithmetic we can solve this by scaling up before operations, preserving the decimals that integer division would destroy:
 
 ```rust
 const PRECISION: u128 = 1_000_000_000; // 10^9
@@ -53,14 +54,14 @@ let percentage = 333_333_333u128; // 0.3333... * PRECISION
 let amount = 1000u128;
 
 let result = (amount * percentage) / PRECISION;
-// result = 333 - we preserved the decimal places
+// result = 333 (we preserved the decimal places)
 ```
 
 The pattern: multiply by `PRECISION` to work in "decimal space," then divide at the end to return to normal integers.
 
 Common precision constants you'll see in DeFi:
 
-| Constant | Value | Use Case |
+| **Constant** | **Value** | **Use Case** |
 |----------|-------|----------|
 | `BPS` | 10,000 | Fee percentages (1 BPS = 0.01%) |
 | `PRECISION` | 10^9 or 10^18 | General calculations |
@@ -70,30 +71,39 @@ Common precision constants you'll see in DeFi:
 
 <ArticleSection name="The Golden Rule of Rounding" id="golden-rule" level="h2" />
 
-Even when using the right precision, it's almost impossible not to give out some tokens to rounding.
+Even with the right precision, rounding errors are unavoidable. Integer division always truncates.
 
-This is completely fine, the main question would be: who loses in that situation?
+The question isn't whether to round, it's who absorbs the loss: the protocol or the user?
 
 Consider this deposit function that rounds in the user's favor:
 
 ```rust
 pub fn deposit(amount: u64, total_shares: u64, total_assets: u64) -> u64 {
-    // Round UP - user gets more shares
+    // Round UP - user gets more shares than they mathematically deserve
     let shares = (amount * total_shares + total_assets - 1) / total_assets;
     shares
 }
 ```
 
-An attacker exploits this:
+Here's how an attacker exploits this:
 
-1. Deposit 1 lamport
-2. Math: `(1 * 1000 + 999) / 1000 = 1` share (should be 0.001)
-3. Withdraw that 1 share
-4. Math: `(1 * 1000) / 1000 = 1` lamports back... but wait
+```
+Pool state: 100 shares, 1000 USDC
+Fair price: 1 share = 10 USDC
 
-The attacker repeated this millions of times in a loop. Each iteration, the rounding error compounds. The protocol slowly bleeds value until it's drained.
+Step 1: Deposit 5 USDC
+  Fair shares: 5 × 100 / 1000 = 0.5 → should round to 0
+  With round UP: (5 × 100 + 999) / 1000 = 1 share ← extra share!
 
-**The fix is the golden rule: round so the protocol keeps more value, never less.**
+Step 2: Withdraw that 1 share
+  Assets out: 1 × 1000 / 100 = 10 USDC
+
+Result: Put in 5 USDC, got back 10 USDC.
+```
+
+The attacker doubled their money. Repeat in a loop, and the pool drains as other depositors' value is extracted one rounding error at a time.
+
+> Always round so the protocol keeps more value, never less.
 
 As much as this could appear as greediness, it's just about making attacks unprofitable. 
 
@@ -115,29 +125,45 @@ When rounding favors the protocol, the attacker loses gas fees on each iteration
 
 ### Implementation
 
-Round DOWN is the default in Rust. Integer division truncates toward zero:
+The base formula for calculating shares from a deposit:
+
+```
+shares = (deposit × total_shares) / total_assets
+```
+
+**Round DOWN** (default in Rust, integer division truncates):
 
 ```rust
-// Round DOWN (default behavior)
+// User deposits, protocol mints shares - round DOWN to protect protocol
 let shares = (deposit * total_shares) / total_assets;
 ```
 
-Round UP requires a trick. Add `(divisor - 1)` before dividing:
+**Round UP** (add `divisor - 1` to numerator):
 
 ```rust
-// Round UP
-let debt = (borrow * total_debt + total_shares - 1) / total_shares;
+// User deposits, protocol mints shares - round UP favors user (dangerous!)
+let shares = (deposit * total_shares + total_assets - 1) / total_assets;
 ```
 
-Why does this work? Adding `divisor - 1` ensures any remainder pushes the result to the next integer:
+Why does adding `divisor - 1` round up? It ensures any remainder pushes to the next integer:
 
-- `7 / 3 = 2` (truncates 0.33)
-- `(7 + 2) / 3 = 9 / 3 = 3` (remainder captured)
+```
+Without trick: 7 / 3 = 2  (truncates the 0.33 remainder)
+With trick:    (7 + 2) / 3 = 9 / 3 = 3  (remainder captured)
 
-Here's a helper function you'll use constantly:
+Without trick: 6 / 3 = 2  (no remainder)
+With trick:    (6 + 2) / 3 = 8 / 3 = 2  (still 2, no false rounding)
+```
+
+For this reason, here are some helper functions you'll use constantly:
 
 ```rust
-/// Divide with rounding up
+/// Round down
+pub fn div_floor(numerator: u128, denominator: u128) -> u128 {
+    numerator / denominator
+}
+
+/// Round up
 pub fn div_ceil(numerator: u128, denominator: u128) -> u128 {
     (numerator + denominator - 1) / denominator
 }
@@ -145,9 +171,9 @@ pub fn div_ceil(numerator: u128, denominator: u128) -> u128 {
 
 <ArticleSection name="Safe Math" id="safe-math" level="h2" />
 
-### Overflow Protection
+DeFi deals with large numbers. When using multiplication inside a pool with $100M in TVL, the math can overflow a `u64` easily. 
 
-DeFi deals with large numbers. A pool with $100M in TVL using 18 decimal precision can overflow `u64` easily. Always use `checked_*` operations:
+For this reason you should always use `checked_*` operations:
 
 ```rust
 // Bad: can overflow silently in release builds
@@ -159,7 +185,7 @@ let result = a
     .checked_div(c)?;
 ```
 
-For intermediate calculations, use `u128`:
+And for intermediate calculations, you should transform them into a `u128` before normalizing it to u64 after divisions:
 
 ```rust
 // Token amounts are u64, but intermediate math needs u128
@@ -168,7 +194,9 @@ let shares: u64 = ((deposit as u128)
     .checked_div(total_assets as u128)?) as u64;
 ```
 
-> Rust's standard arithmetic operators overflow silently in release builds. Your tests pass, your mainnet deployment wraps `u64::MAX + 1` to `0`, and your protocol is drained. Always use `checked_*` operations in production code.
+The main reason to use `*_checked` is that Rust's standard arithmetic operators overflow silently during release builds; this means that even if your tests pass, your mainnet deployment wraps `u64::MAX + 1` to `0`. 
+
+> Always use `checked_*` operations in production code.
 
 ### Order of Operations
 
@@ -184,16 +212,9 @@ let result = (7 / 3) * 100;  // = 2 * 100 = 200
 let result = (7 * 100) / 3;  // = 700 / 3 = 233
 ```
 
-Same inputs. 16% difference in output. The division-first approach destroyed precision before multiplication could preserve it.
+Same inputs but 16% difference in output. The division-first approach destroyed precision before multiplication could preserve it.
 
-**The rule: multiply before you divide.** Every division truncates. Delay it as long as possible.
-
-But watch for overflow. If `a * b` might overflow, you need `u128`:
-
-```rust
-// Safe: expand to u128, multiply, divide, then truncate back
-let result = (u128::from(a) * u128::from(b) / u128::from(c)) as u64;
-```
+> Every division truncates your number; you should delay them till you finished all other operations first.
 
 <ArticleSection name="Key Formulas Preview" id="key-formulas" level="h2" />
 
@@ -210,8 +231,9 @@ let output = (reserve_out * amount_in) / (reserve_in + amount_in);
 ### LP Token Mint
 
 ```rust
-// First deposit: geometric mean
-let initial_shares = (amount_a * amount_b).integer_sqrt();
+// First deposit: 1:1 deposit
+let initial_shares = std::cmp::min(amount_a, amount_b)
+
 
 // Subsequent deposits: proportional
 let shares = min(
