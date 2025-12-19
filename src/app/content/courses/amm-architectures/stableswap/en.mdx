@@ -2,15 +2,15 @@ import { ArticleSection } from "../../../../components/ArticleSection/ArticleSec
 
 # StableSwap
 
-In January 2020, Michael Egorov launched Curve Finance with a whitepaper that solved a specific problem: constant product AMMs are terrible for stablecoins.
+In January 2020, Michael Egorov launched Curve Finance with a [whitepaper](https://berkeley-defi.github.io/assets/material/StableSwap.pdf) that solved a specific problem: constant product AMMs are terrible for stablecoins.
 
-If USDC and USDT should both be worth $1, why does swapping 10,000 USDC for USDT cost 1% in slippage? The math was wrong for the use case.
+If USDC and USDT should both be worth $1, why is there slippage?
 
-Curve's StableSwap invariant changed everything. Today, Curve handles billions in stablecoin volume with slippage measured in basis points, not percentages.
+Curve's StableSwap invariant changed everything and today, they handles billions in stablecoin volume.
 
 <ArticleSection name="The Problem with Constant Product" id="the-problem" level="h2" />
 
-### Why x*y=k Fails for Stablecoins
+### Why `x * y = k` doesn't work for Stablecoins
 
 Consider a USDC/USDT pool with $2M liquidity (1M USDC, 1M USDT):
 
@@ -28,11 +28,11 @@ Actual: 90,909 USDT
 Slippage: 9.1%
 ```
 
-A 9% loss to swap two assets that should be identical in value. This is unacceptable.
+A 9% loss to swap two assets that should be identical in value.
 
 ### The Mathematical Reason
 
-Constant product creates a hyperbolic curve. Near the center (balanced pool), it's relatively flat. But it curves away quickly:
+Constant product creates a hyperbolic curve where the center (for balanced pool), it's relatively flat. But it curves away quickly:
 
 ```
 Price impact = (amount_in / reserve_in) * 100%
@@ -42,7 +42,7 @@ For 10% of pool size:
 - Scales roughly linearly
 ```
 
-The curve treats USDC and USDT as if they could have any price ratio, providing liquidity for scenarios where USDC is worth 10x USDT or vice versa. For stablecoins, this liquidity is wasted.
+The curve treats USDC and USDT as if they could have any price ratio, providing liquidity for scenarios where USDC could be worth 10x USDT or vice versa.
 
 <ArticleSection name="The StableSwap Insight" id="insight" level="h2" />
 
@@ -58,11 +58,11 @@ Consider two formulas:
 - Infinite liquidity: Pool can never be fully drained
 - Problem: High slippage, even for pegged assets
 
-What if you could blend them?
+What if there was a way to blend them?
 
 ### The StableSwap Invariant
 
-Curve's insight: create a formula that behaves like constant sum near the center (low slippage) but like constant product at the extremes (can't be drained).
+Curve created a formula that behaves like constant sum near the center (low slippage) but like constant product at the extremes (can't be drained).
 
 The invariant for two tokens:
 
@@ -81,10 +81,9 @@ This looks complex. Let's break it down.
 ### Understanding the Amplification Parameter (A)
 
 The amplification parameter `A` controls how "stable" the curve is:
-
-**A = 0**: Pure constant product (x*y=k)
-**A = ∞**: Pure constant sum (x+y=k)
-**A = 100-2000**: Typical range for stablecoin pools
+- **A = 0**: Pure constant product (x*y=k)
+- **A = ∞**: Pure constant sum (x+y=k)
+- **A = 100-2000**: Typical range for stablecoin pools
 
 ```
 Low A (10):
@@ -104,17 +103,19 @@ High A (2000):
                     Constant Sum (x+y=k)
                     /
                    /
-                  /    StableSwap curve
-                 /   /   (high A)
-                /   /
-               /  /
-              / /
-             //
+                  /     StableSwap curve
+                 /     /   (high A)
+                /    /
+               /   /
+              /  /
+             / /
             /------------ Constant Product (x*y=k)
            /
 ```
 
-Near balance, StableSwap follows constant sum (flat, low slippage). As imbalance grows, it bends toward constant product (can't be drained).
+When both stable's are in equal liqudiity, the curve StableSwap follows the constant sum formula providing low slippage. 
+
+As imbalance between assets grows, it bends toward the constant product formula so it can't be drained and arbitrageurs are incentivesed to rebalance it.
 
 <ArticleSection name="The Math Deep Dive" id="math" level="h2" />
 
@@ -139,7 +140,7 @@ Find: dy (amount of Y received)
 
 ### Newton's Method for Solving
 
-The invariant can't be solved algebraically for y. Implementations use Newton's method:
+Since the invariant can't be solved algebraically for y, the implementations must use Newton's method:
 
 ```rust
 fn get_y(x_new: u128, d: u128, a: u128) -> u128 {
@@ -173,7 +174,7 @@ fn get_y(x_new: u128, d: u128, a: u128) -> u128 {
 
 ### Computing D (Invariant Value)
 
-When the pool is balanced (equal values of each token), D equals the total value. Computing D also requires iteration:
+When the pool is balanced (equal values of each token), D equals the total value. Computing D also requires using the Newton method:
 
 ```rust
 fn get_d(reserves: &[u128], a: u128) -> u128 {
@@ -234,7 +235,7 @@ Slippage: 0.015%
 Received: 99,985 USDT
 ```
 
-The difference is dramatic. For stablecoin swaps, StableSwap is 100-1000x more efficient.
+For stablecoin, using the StableSwap formula, swapping is 100-1000x more efficient.
 
 ### Trade Size Scaling
 
@@ -252,43 +253,95 @@ StableSwap maintains low slippage for much larger trades.
 
 ### When Stablecoins Aren't Stable
 
-High A values assume assets stay pegged. When they don't, bad things happen.
+High A values assume assets stay pegged. When they don't, interesting dynamics emerge.
 
 **March 2023: USDC Depeg**
 
-Silicon Valley Bank collapsed. Circle had $3.3B in deposits there. USDC briefly traded at $0.87.
+Silicon Valley Bank collapsed. Circle had $3.3B in deposits there. USDC traded at $0.87 on external markets.
 
-Curve pools with high A values experienced:
-- Massive imbalance as traders dumped USDC
-- Slippage spiked despite the flat curve
-- LPs took significant losses
-
-### Why High A is Dangerous During Depegs
+What happened in Curve pools:
 
 ```
 Pool: 1M USDC, 1M USDT (A=1000)
-USDC depegs to $0.90
+External price: USDC = $0.87
 
-Arbitrageurs dump USDC for USDT:
-- Pool becomes 1.5M USDC, 0.5M USDT
-- StableSwap curve is still relatively flat
-- More USDC can be dumped at near-1:1 rates
-- LPs are buying USDC at $1 when it's worth $0.90
+Arbitrageur buys USDC at $0.87 on Coinbase
+Swaps in Curve pool: 100K USDC → ~99.5K USDT (0.5% slippage)
+Profit: $12,000 per 100K swapped
+
+Even as pool becomes 1.5M USDC / 0.5M USDT:
+- Curve still offers ~0.95 USDT per USDC
+- External market: 0.87 USDT per USDC
+- Arbitrage remains profitable → dumping continues
 ```
 
-The flat curve that enables low slippage also enables LPs to be drained during depegs.
+The flat curve keeps offering near-1:1 rates while external markets price USDC at a discount. Arbitrageurs will drain USDT until the curve steepens enough that pool price matches external price.
 
-### Choosing A Values
+### The LP Perspective
+
+LPs are effectively buying USDC at pool prices (~$0.95-0.99) when it's worth $0.87 externally. Their pool shifts from 50/50 to mostly USDC.
+
+**If the peg recovers** (like USDC did): LPs are fine. They hold USDC that's now worth $1 again. The temporary imbalance reverses.
+
+**If the peg fails permanently** (like UST): LPs are holding a worthless asset they bought at near-par. Catastrophic loss.
+
+The USDC depeg recovered within days. LPs who didn't panic-withdraw were made whole. But the risk was real, if Circle had been insolvent, those LPs would have been devastated.
+
+### Mitigation Strategies
+
+**1. Lower A Values**
+
+More curve = faster price response. The pool reaches external market price sooner, limiting LP exposure.
 
 | Asset Type | Recommended A | Reasoning |
 |------------|---------------|-----------|
 | USDC/USDT | 200-500 | Highly stable, both regulated |
 | DAI/USDC | 100-200 | DAI has more volatility |
 | stETH/ETH | 50-100 | LST can depeg under stress |
-| FRAX/USDC | 100-200 | Algorithmic component |
 | Exotic stables | 10-50 | Higher risk of depeg |
 
-Lower A = more protection during depegs, but higher slippage during normal operation.
+**2. Oracle Integration**
+
+Monitor external prices. If oracle shows significant depeg:
+- Pause swaps entirely
+- Dynamically lower A
+- Adjust virtual price to reflect reality
+
+```rust
+fn check_depeg(oracle_price: u64, pool_price: u64, threshold_bps: u64) -> bool {
+    let diff = if oracle_price > pool_price {
+        oracle_price - pool_price
+    } else {
+        pool_price - oracle_price
+    };
+    diff * 10_000 / oracle_price > threshold_bps
+}
+```
+
+**3. Dynamic A (Ramping)**
+
+Never change A instantly. Ramp over hours/days to prevent manipulation and allow markets to adjust:
+
+```rust
+fn get_current_a(initial_a: u64, future_a: u64, ramp_start: i64, ramp_end: i64, now: i64) -> u64 {
+    if now >= ramp_end { return future_a; }
+    if now <= ramp_start { return initial_a; }
+    
+    let elapsed = now - ramp_start;
+    let duration = ramp_end - ramp_start;
+    
+    // Linear interpolation
+    initial_a + (future_a - initial_a) * elapsed / duration
+}
+```
+
+**4. Volume Limits**
+
+Cap how much can be swapped per block or per time window. Slows down arbitrage drainage during acute depegs.
+
+**5. Circuit Breakers**
+
+If imbalance exceeds threshold (e.g., 80/20 ratio), pause swaps or require governance intervention.
 
 <ArticleSection name="Multi-Token Pools" id="multi-token" level="h2" />
 
