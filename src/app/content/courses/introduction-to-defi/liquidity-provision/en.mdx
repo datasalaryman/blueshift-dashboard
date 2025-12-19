@@ -2,21 +2,17 @@ import { ArticleSection } from "../../../../components/ArticleSection/ArticleSec
 
 # Liquidity Provision
 
-AMMs need liquidity to trade against. Those tokens come from liquidity providers who deposit assets to earn trading fees; this means that without LPs, there would be no liquidity and without liquidity, there's no DeFi.
+You deposit 100 SOL and 10,000 USDC into a pool; six months later, the pool holds 150 SOL and 8,000 USDC. How do you know what's yours?
 
-LP tokens represent your share of a pool: Deposit SOL and USDC, receive LP tokens in weighted capacity that you can burn to withdraw your proportional share of whatever's in the pool.
+You can't track specific tokens, they're fungible and constantly moving through swaps. Instead, you get **LP tokens**: a claim on a percentage of whatever's in the pool.
 
-Simple concept. But the math hides complexity that catches most developers off guard: impermanent loss, first depositor attacks, and sandwich exploits.
+Hold 10% of LP tokens? You can redeem them for 10% of each reserve. The pool composition changes, but your percentage stays constant.
+
+Simple concept. But the math hides traps: how do you price the first deposit? What happens when prices move against you? How do attackers exploit rounding errors?
 
 <ArticleSection name="LP Token Mechanics" id="lp-mechanics" level="h2" />
 
-As explained before, LP tokens represent your deposit of 100 SOL and 10,000 USDC into a pool. 
-
-Six months later, when you finally want your tokens back, you could find that the pool now has 150 SOL and 8,000 USDC from trading activity. How do you know what's yours?
-
-LP tokens solve this. They're a claim on a proportional share of the pool; not specific tokens, but a percentage of whatever's there. 
-
-If you hold 10% of LP tokens, you can redeem them for 10% of each token in the pool.
+LP tokens are shares. Like stock in a company, they represent ownership of underlying assets without tracking specific units.
 
 ```rust
 #[account]
@@ -100,9 +96,9 @@ pub fn burn_lp(
 
 ### The Hidden Cost
 
-You deposit $1000 of SOL and $1000 of USDC into a pool. SOL doubles in price. You withdraw. How much do you have?
+You deposit $1000 of SOL and $1000 of USDC into a pool. After SOL doubles in price you think you'll actually receive $3000. 
 
-Not $3000. You have $2828. What happened to the other $172?
+But you actually only receive $2828. What happened to the other $172?
 
 This is **impermanent loss**. As price diverges, the pool rebalances. Arbitrageurs buy the cheap asset and sell the expensive one until pool prices match market prices. 
 

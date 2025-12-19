@@ -6,19 +6,19 @@ October 2022. A trader named Avraham Eisenberg deposited $10 million into Mango 
 
 The price spiked 10x in minutes and the oracle dutifully reported this "real" price so while Eisenberg's long position showed $400M in unrealized profit, he borrowed against it and withdrew real assets. The MNGO price collapsed leaving Mango with $114M in bad debt.
 
-The exploit wasn't a bug in Mango's Rust code. It was a failure to understand what oracle data actually means.
+The exploit wasn't a bug in Mango's Rust code. It was a failure to make sure oracles rapresented the right data.
 
 ### The Oracle Problem
 
-Blockchains are isolated systems. A Solana program can't call a web API, scrape a price from Coinbase, or check the weather. Everything on-chain must come from on-chain data.
+Blockchains are isolated systems: a Solana program can't call a web API, scrape a price from Coinbase, or check the weather. Everything on-chain must come from on-chain data.
 
 But DeFi needs real-world prices. How much is SOL worth in USD? What's ETH/BTC? Without external price data, lending protocols can't value collateral, perpetuals can't calculate PnL, and liquidations can't trigger.
 
-Oracles bridge this gap. Trusted parties (like Pyth or Switchboard) aggregate prices from multiple sources and publish them to on-chain accounts that your program can read.
+Oracles bridge this gap: trusted parties (like Pyth or Switchboard) aggregate prices from multiple sources and publish them to on-chain accounts that your program can read.
 
 This lesson covers what you need from oracles and, critically, how to avoid getting exploited.
 
-> For complete Pyth and Switchboard implementation details, see the dedicated Oracle Integration course. This lesson covers the essentials for understanding oracle security.
+> For complete Pyth and Switchboard implementation details, see the dedicated [Oracle Integration](/courses/oracles-on-solana) course. This lesson covers the essentials for understanding oracle security.
 
 <ArticleSection name="What You Need From an Oracle" id="oracle-requirements" level="h2" />
 
